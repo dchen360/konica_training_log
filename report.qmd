@@ -1,0 +1,52 @@
+---
+title: "Konica Minolta Reliability Report"
+toc: true
+number-sections: true
+format:
+  html:
+    theme: cosmo
+    toc-depth: 3
+    code-fold: false
+---
+
+# Study Participants
+
+{{< include results/analysis/report_participant_data_overview.md >}}
+
+## Pairwise Summaries
+
+{{< include results/analysis/report_participant_pairwise_summary.md >}}
+
+## Bland-Altman Plots
+
+The Bland-Altman plots below show pairwise agreement by rater pair, with body sites distinguished by symbol. The limits of agreement were estimated from a random-intercept model on pairwise differences to account for repeated measures within participant.
+
+{{< include results/analysis/report_participant_bland_altman.md >}}
+
+## Statistical Model
+
+{{< include results/analysis/report_participant_model_main.md >}}
+
+{{< include results/analysis/report_participant_model_interaction.md >}}
+
+# Monk Scale
+
+## Intra-operator Variation
+
+{{< include results/analysis/report_monk_intra_operator.md >}}
+
+## Pairwise Summaries
+
+{{< include results/analysis/report_monk_pairwise_summary.md >}}
+
+## Bland-Altman Plots
+
+The Bland-Altman plots below show pairwise agreement by rater pair, with points colored by Monk Scale group. The limits of agreement were estimated from a random-intercept model on pairwise differences to account for repeated measurements within each Monk Scale level.
+
+{{< include results/analysis/report_monk_bland_altman.md >}}
+
+# Ella Measurements
+
+## Intra-operator Variation
+
+{{< include results/analysis/report_ella_intra_operator.md >}}

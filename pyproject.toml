@@ -1,0 +1,30 @@
+[project]
+name = "konica-training-log"
+version = "0.1.0"
+description = "Interrater reliability analysis for Konica Minolta measurements."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "matplotlib>=3.9",
+  "numpy>=2.0",
+  "openox-library @ git+https://github.com/lawtj/openox-library.git@716556f791297a1d592541fdf84760803729f8c5; sys_platform == 'darwin'",
+  "openpyxl>=3.1",
+  "pandas>=2.2",
+  "seaborn>=0.13",
+  "statsmodels>=0.14",
+]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.12",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.uv]
+environments = ["sys_platform == 'darwin'"]
