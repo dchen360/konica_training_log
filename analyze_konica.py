@@ -15,15 +15,22 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 
 
-RATER_PATTERN = re.compile(r"(?<![A-Za-z])(KH|EB|RVZ)(?![A-Za-z])", re.IGNORECASE)
-SID_PATTERN = re.compile(r"SID\s*([0-9]{4})", re.IGNORECASE)
+RATER_PATTERN = re.compile(r"(?<![A-Za-z])(KH|EB|RVZ|LER)(?![A-Za-z])", re.IGNORECASE)
+DATE_PATTERN = re.compile(r"(?P<month>\d{1,2})-(?P<day>\d{1,2})-(?P<year>\d{2,4})")
+SID_PATTERN = re.compile(r"SID\s*([0-9]{3,4})", re.IGNORECASE)
+LEGACY_SUBJECT_ID_PATTERN = re.compile(r"Subject\s+\d+\s+\(([0-9]{3,4})\)", re.IGNORECASE)
+OPERATOR_SUFFIX_PATTERN = re.compile(r"(KH|EB|RVZ|LER)\)?(?:\s*\(\d+\))?\s*$", re.IGNORECASE)
 REQUIRED_RAW_COLUMNS = ("Group", "L*", "b*")
 BODY_SITE_NORMALIZATION = {
     "Palmer": "Palmar",
+    "Arm": "Inner Upper Arm",
+    "Arms": "Inner Upper Arm",
+    "Inner arm": "Inner Upper Arm",
 }
+PARTICIPANT_BODY_SITE_ORDER = ["Inner Upper Arm", "Dorsal", "Forehead", "Palmar"]
 BODY_SITE_PLOT_ORDER = ["Arm", "Chest", "Dorsal", "Ear", "Forehead", "Palmar"]
 BODY_SITE_MARKERS = {
-    "Arm": "o",
+    "Inner Upper Arm": "o",
     "Chest": "s",
     "Dorsal": "^",
     "Ear": "D",
@@ -55,10 +62,6 @@ ELLA_PARTICIPANT_MARKERS = {
     "Lily": "s",
     "Katie": "^",
 }
-MAIN_MODEL_FORMULA = "measurement ~ C(rater, Treatment(reference='KH')) + C(body_site)"
-INTERACTION_MODEL_FORMULA = "measurement ~ C(rater, Treatment(reference='KH')) * C(body_site)"
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Analyze Konica Minolta participant, Monk Scale, and Ella datasets."
@@ -107,7 +110,7 @@ def list_raw_files(path: Path) -> list[Path]:
 
     files = sorted(
         file
-        for file in path.iterdir()
+        for file in path.rglob("*")
         if file.is_file() and file.suffix.lower() in {".csv", ".xlsx", ".xls"}
     )
     if not files:
@@ -116,17 +119,35 @@ def list_raw_files(path: Path) -> list[Path]:
 
 
 def extract_rater_from_filename(path: Path) -> str:
-    match = RATER_PATTERN.search(path.name)
+    match = OPERATOR_SUFFIX_PATTERN.search(path.stem)
     if not match:
-        raise ValueError(f"Could not extract rater code KH, EB, or RVZ from filename: {path.name}")
+        match = RATER_PATTERN.search(path.name)
+    if not match:
+        raise ValueError(f"Could not extract rater code KH, EB, RVZ, or LER from filename: {path.name}")
     return match.group(1).upper()
 
 
 def extract_participant_from_filename(path: Path) -> str:
     match = SID_PATTERN.search(path.name)
+    if match:
+        return match.group(1)
+    match = LEGACY_SUBJECT_ID_PATTERN.search(path.name)
+    if match:
+        return match.group(1)
+    raise ValueError(f"Could not extract participant SID/ID from filename: {path.name}")
+
+
+def extract_date_from_filename(path: Path) -> str:
+    match = DATE_PATTERN.search(path.name)
     if not match:
-        raise ValueError(f"Could not extract a 4-digit SID from filename: {path.name}")
-    return match.group(1)
+        raise ValueError(f"Could not extract date from filename: {path.name}")
+    month = int(match.group("month"))
+    day = int(match.group("day"))
+    year_text = match.group("year")
+    year = int(year_text)
+    if len(year_text) == 2:
+        year += 2000
+    return f"{year:04d}-{month:02d}-{day:02d}"
 
 
 def build_session_id(path: Path, rater: str) -> str:
@@ -173,6 +194,7 @@ def load_single_raw_file(path: Path, *, include_participant: bool) -> pd.DataFra
     konica = df.copy()
     konica["source_file"] = path.name
     konica["rater"] = rater
+    konica["operator"] = rater
     konica["session_id"] = build_session_id(path, rater)
     konica["body_site"] = konica["Group"].astype(str).str.strip()
     konica["body_site"] = konica["body_site"].replace(BODY_SITE_NORMALIZATION)
@@ -183,7 +205,10 @@ def load_single_raw_file(path: Path, *, include_participant: bool) -> pd.DataFra
     konica["ita"] = konica.apply(lambda row: compute_ita(row["L*"], row["b*"]), axis=1)
 
     if include_participant:
-        konica["participant"] = extract_participant_from_filename(path)
+        sid = extract_participant_from_filename(path)
+        konica["participant"] = sid
+        konica["SID"] = sid
+        konica["Date"] = extract_date_from_filename(path)
 
     return konica
 
@@ -204,15 +229,43 @@ def select_median_ita_rows(df: pd.DataFrame, group_columns: list[str]) -> pd.Dat
 
 
 def participant_files(files: list[Path]) -> list[Path]:
+    return [file for file in files if "subject" in file.name.lower()]
+
+
+def participant_reference_rater(raters: list[str]) -> str:
+    for candidate in ["KH", "LER", "EB", "RVZ"]:
+        if candidate in raters:
+            return candidate
+    return sorted(raters)[0]
+
+
+def participant_pair_order(raters: list[str]) -> list[tuple[str, str]]:
+    excluded_pairs = {frozenset({"EB", "LER"}), frozenset({"EB", "RVZ"})}
     return [
-        file
-        for file in files
-        if "monk scale" not in file.name.lower() and "test with" not in file.name.lower()
+        pair
+        for pair in itertools.combinations(sorted(raters), 2)
+        if frozenset(pair) not in excluded_pairs
     ]
 
 
+def participant_model_formulas(reference_rater: str) -> tuple[str, str]:
+    main_formula = f"measurement ~ C(rater, Treatment(reference='{reference_rater}')) + C(body_site)"
+    interaction_formula = f"measurement ~ C(rater, Treatment(reference='{reference_rater}')) * C(body_site)"
+    return main_formula, interaction_formula
+
+
 def monk_files(files: list[Path]) -> list[Path]:
-    return [file for file in files if "monk scale" in file.name.lower()]
+    selected: list[Path] = []
+    for file in files:
+        if "monk scale" not in file.name.lower():
+            continue
+        try:
+            rater = extract_rater_from_filename(file)
+        except ValueError:
+            continue
+        if rater in {"KH", "EB", "RVZ"}:
+            selected.append(file)
+    return selected
 
 
 def ella_files(files: list[Path]) -> list[Path]:
@@ -229,7 +282,8 @@ def ella_files(files: list[Path]) -> list[Path]:
 def load_participant_data(files: list[Path]) -> pd.DataFrame:
     frames = [load_single_raw_file(file, include_participant=True) for file in files]
     combined = pd.concat(frames, ignore_index=True)
-    return select_median_ita_rows(combined, ["participant", "rater", "body_site"])
+    combined = combined[combined["body_site"].isin(PARTICIPANT_BODY_SITE_ORDER)].copy()
+    return select_median_ita_rows(combined, ["body_site", "Date", "SID", "operator"])
 
 
 def load_monk_data(files: list[Path]) -> pd.DataFrame:
@@ -255,10 +309,26 @@ def load_ella_data(files: list[Path]) -> pd.DataFrame:
     return reduced.sort_values(["session_id", "body_site"]).reset_index(drop=True)
 
 
+def select_full_rank_columns(exog: pd.DataFrame) -> tuple[list[str], list[str]]:
+    keep_columns: list[str] = []
+    current_rank = 0
+
+    for column in exog.columns:
+        candidate_columns = keep_columns + [column]
+        candidate_rank = int(np.linalg.matrix_rank(exog[candidate_columns].to_numpy()))
+        if candidate_rank > current_rank:
+            keep_columns.append(column)
+            current_rank = candidate_rank
+
+    dropped_columns = [column for column in exog.columns if column not in keep_columns]
+    return keep_columns, dropped_columns
+
+
 def fit_mixed_model(df: pd.DataFrame, formula: str, group_column: str) -> tuple:
     _, exog = patsy.dmatrices(formula, data=df, return_type="dataframe")
-    keep_columns = [column for column in exog.columns if column == "Intercept" or exog[column].nunique() > 1]
-    dropped_columns = [column for column in exog.columns if column not in keep_columns]
+    varying_columns = [column for column in exog.columns if column == "Intercept" or exog[column].nunique() > 1]
+    exog = exog[varying_columns]
+    keep_columns, dropped_columns = select_full_rank_columns(exog)
     exog = exog[keep_columns]
     endog = df["measurement"]
     model = sm.MixedLM(endog=endog, exog=exog, groups=df[group_column])
@@ -266,10 +336,11 @@ def fit_mixed_model(df: pd.DataFrame, formula: str, group_column: str) -> tuple:
     return result, dropped_columns
 
 
-def fit_participant_models(df: pd.DataFrame) -> tuple:
-    model_main, main_dropped = fit_mixed_model(df, MAIN_MODEL_FORMULA, "participant")
-    model_interaction, interaction_dropped = fit_mixed_model(df, INTERACTION_MODEL_FORMULA, "participant")
-    return model_main, main_dropped, model_interaction, interaction_dropped
+def fit_participant_models(df: pd.DataFrame, reference_rater: str) -> tuple:
+    main_formula, interaction_formula = participant_model_formulas(reference_rater)
+    model_main, main_dropped = fit_mixed_model(df, main_formula, "participant")
+    model_interaction, interaction_dropped = fit_mixed_model(df, interaction_formula, "participant")
+    return model_main, main_dropped, model_interaction, interaction_dropped, main_formula, interaction_formula
 
 
 def build_pairwise_dataset(
@@ -352,6 +423,7 @@ def make_bland_altman_plots(
     palette: dict[str, str] | None = None,
     style_column: str | None = None,
     markers: dict[str, str] | None = None,
+    legend_kwargs: dict | None = None,
 ) -> None:
     sns.set_theme(style="whitegrid")
     for stale_path in output_dir.glob(f"{filename_prefix}_*.png"):
@@ -434,7 +506,10 @@ def make_bland_altman_plots(
         ax.tick_params(axis="both", labelsize=12)
         for tick_label in ax.get_xticklabels() + ax.get_yticklabels():
             tick_label.set_fontweight("bold")
-        ax.legend(loc="best", frameon=True)
+        final_legend_kwargs = {"loc": "best", "frameon": True}
+        if legend_kwargs is not None:
+            final_legend_kwargs.update(legend_kwargs)
+        ax.legend(**final_legend_kwargs)
         fig.tight_layout()
 
         output_path = output_dir / f"{filename_prefix}_{safe_slug(rater_pair)}.png"
@@ -449,6 +524,9 @@ def write_model_summary(model, destination: Path) -> None:
 def write_preprocessed_data(df: pd.DataFrame, destination: Path) -> None:
     preferred_columns = [
         "participant",
+        "SID",
+        "Date",
+        "operator",
         "session_id",
         "source_file",
         "rater",
@@ -507,42 +585,38 @@ def format_p_value(value: float) -> str:
 
 def build_data_overview_markdown(df: pd.DataFrame) -> str:
     participants = df["participant"].nunique()
-    raters = ", ".join(sorted(df["rater"].unique()))
+    operator_column = "operator" if "operator" in df.columns else "rater"
+    raters = ", ".join(sorted(df[operator_column].unique()))
     body_sites = ", ".join(sorted(df["body_site"].unique()))
-    return (
-        f"Unique participants count: {participants}\n\n"
-        f"Included raters: {raters}\n\n"
-        f"Included body sites: {body_sites}"
-    )
+    lines = [
+        f"Unique participants count: {participants}",
+        f"Included operators: {raters}",
+        f"Included body sites: {body_sites}",
+    ]
+    return "\n\n".join(lines)
 
 
-def build_main_model_markdown(model) -> str:
-    eb_term = "C(rater, Treatment(reference='KH'))[T.EB]"
-    rvz_term = "C(rater, Treatment(reference='KH'))[T.RVZ]"
-    eb_coef = float(model.fe_params[eb_term])
-    eb_p = float(model.pvalues[eb_term])
-    rvz_coef = float(model.fe_params[rvz_term])
-    rvz_p = float(model.pvalues[rvz_term])
-    return (
-        "By fitting a linear mixed-effects model "
-        f"(`{MAIN_MODEL_FORMULA} + (1 | participant)`), EB vs KH had coefficient {eb_coef:.2f} "
-        f"({format_p_value(eb_p)}), and RVZ vs KH had coefficient {rvz_coef:.2f} "
-        f"({format_p_value(rvz_p)})."
-    )
+def build_model_markdown(model, formula: str, reference_rater: str) -> str:
+    comparisons: list[str] = []
+    prefix = f"C(rater, Treatment(reference='{reference_rater}'))[T."
+    for term, coefficient in model.fe_params.items():
+        if not term.startswith(prefix) or ":" in term:
+            continue
+        comparison_rater = term.removeprefix(prefix).removesuffix("]")
+        p_value = float(model.pvalues[term])
+        comparisons.append(
+            f"{comparison_rater} vs {reference_rater} had coefficient {float(coefficient):.2f} ({format_p_value(p_value)})"
+        )
 
+    if not comparisons:
+        return (
+            "By fitting a linear mixed-effects model "
+            f"(`{formula} + (1 | participant)`), no rater contrast terms remained after removing non-varying columns."
+        )
 
-def build_interaction_model_markdown(model) -> str:
-    eb_term = "C(rater, Treatment(reference='KH'))[T.EB]"
-    rvz_term = "C(rater, Treatment(reference='KH'))[T.RVZ]"
-    eb_coef = float(model.fe_params[eb_term])
-    eb_p = float(model.pvalues[eb_term])
-    rvz_coef = float(model.fe_params[rvz_term])
-    rvz_p = float(model.pvalues[rvz_term])
     return (
         "By fitting a linear mixed-effects model "
-        f"(`{INTERACTION_MODEL_FORMULA} + (1 | participant)`), EB vs KH had coefficient {eb_coef:.2f} "
-        f"({format_p_value(eb_p)}), and RVZ vs KH had coefficient {rvz_coef:.2f} "
-        f"({format_p_value(rvz_p)})."
+        f"(`{formula} + (1 | participant)`), " + ", and ".join(comparisons) + "."
     )
 
 
@@ -606,21 +680,6 @@ def build_monk_intra_markdown(df: pd.DataFrame, summary_df: pd.DataFrame) -> str
     return "\n".join(lines)
 
 
-def summarize_ella_intra_operator(df: pd.DataFrame) -> pd.DataFrame:
-    return (
-        df.groupby("body_site")
-        .agg(
-            n_sessions=("session_id", "nunique"),
-            mean_ita=("measurement", "mean"),
-            sd_ita=("measurement", "std"),
-            min_ita=("measurement", "min"),
-            max_ita=("measurement", "max"),
-        )
-        .reset_index()
-        .sort_values("body_site")
-    )
-
-
 def make_ella_intra_plot(df: pd.DataFrame, output_path: Path) -> None:
     sns.set_theme(style="whitegrid")
     plot_df = df.copy()
@@ -629,11 +688,6 @@ def make_ella_intra_plot(df: pd.DataFrame, output_path: Path) -> None:
         plot_df["ella_participant"],
         categories=present_participants,
         ordered=True,
-    )
-    summary = (
-        plot_df.groupby("body_site")
-        .agg(mean_ita=("measurement", "mean"), sd_ita=("measurement", "std"))
-        .reset_index()
     )
 
     fig, ax = plt.subplots(figsize=(8, 5.5))
@@ -650,19 +704,6 @@ def make_ella_intra_plot(df: pd.DataFrame, output_path: Path) -> None:
         s=90,
         ax=ax,
     )
-    x_positions = np.arange(len(summary))
-    ax.errorbar(
-        x=x_positions,
-        y=summary["mean_ita"],
-        yerr=summary["sd_ita"].fillna(0.0),
-        fmt="_",
-        color="black",
-        elinewidth=2,
-        capsize=6,
-        markersize=18,
-        label="Mean ± SD",
-    )
-    ax.set_title("Ella EB Median ITA by Body Site", fontsize=15, fontweight="bold")
     ax.set_xlabel("Body site", fontsize=13, fontweight="bold")
     ax.set_ylabel("ITA", fontsize=13, fontweight="bold")
     ax.tick_params(axis="x", rotation=0)
@@ -672,13 +713,11 @@ def make_ella_intra_plot(df: pd.DataFrame, output_path: Path) -> None:
     plt.close(fig)
 
 
-def build_ella_intra_markdown(summary_df: pd.DataFrame, plot_path: Path) -> str:
+def build_ella_intra_markdown(plot_path: Path) -> str:
     return "\n".join(
         [
-            "For Ella EB measurements, the most useful view is body-site specific repeatability rather than a single overall SD.",
-            "The table reports the 3 median ITA values per body site through their mean, SD, and range; the plot shows the individual medians with mean ± SD overlay.",
-            "",
-            markdown_table(summary_df, digits=3),
+            "The current Ella EB sessions come from different participants, so across-participant mean and SD by body site are not reported here.",
+            "This section shows the individual participant-level median ITA values by body site. Per-participant summary statistics can be added later as more repeated sessions become available.",
             "",
             f"![]({plot_path.as_posix()})",
         ]
@@ -687,14 +726,19 @@ def build_ella_intra_markdown(summary_df: pd.DataFrame, plot_path: Path) -> str:
 
 def analyze_participants(files: list[Path], output_dir: Path) -> None:
     df = load_participant_data(files)
-    model_main, _, model_interaction, _ = fit_participant_models(df)
+    raters = sorted(df["rater"].unique())
+    reference_rater = participant_reference_rater(raters)
+    pair_order = participant_pair_order(raters)
+    model_main, _, model_interaction, _, main_formula, interaction_formula = fit_participant_models(
+        df, reference_rater
+    )
     pairwise_df = build_pairwise_dataset(
         df,
-        index_columns=["participant", "body_site"],
-        pair_order=[("KH", "EB"), ("KH", "RVZ")],
+        index_columns=["body_site", "Date", "SID"],
+        pair_order=pair_order,
     )
     summary_df = summarize_pairwise_differences(pairwise_df, ["body_site", "rater_pair"])
-    present_body_sites = [site for site in BODY_SITE_PLOT_ORDER if site in pairwise_df["body_site"].unique()]
+    present_body_sites = [site for site in PARTICIPANT_BODY_SITE_ORDER if site in pairwise_df["body_site"].unique()]
     marker_map = {site: BODY_SITE_MARKERS[site] for site in present_body_sites}
 
     write_preprocessed_data(df, output_dir / "participant_preprocessed_measurements.csv")
@@ -714,10 +758,13 @@ def analyze_participants(files: list[Path], output_dir: Path) -> None:
         markers=marker_map,
     )
     write_markdown_file(output_dir / "report_participant_data_overview.md", build_data_overview_markdown(df))
-    write_markdown_file(output_dir / "report_participant_model_main.md", build_main_model_markdown(model_main))
+    write_markdown_file(
+        output_dir / "report_participant_model_main.md",
+        build_model_markdown(model_main, main_formula, reference_rater),
+    )
     write_markdown_file(
         output_dir / "report_participant_model_interaction.md",
-        build_interaction_model_markdown(model_interaction),
+        build_model_markdown(model_interaction, interaction_formula, reference_rater),
     )
     write_markdown_file(
         output_dir / "report_participant_pairwise_summary.md",
@@ -749,6 +796,7 @@ def analyze_monk(files: list[Path], output_dir: Path) -> None:
         palette=MONK_COLORS,
         style_column=None,
         markers=None,
+        legend_kwargs={"loc": "upper center", "bbox_to_anchor": (0.5, -0.12), "ncol": 5},
     )
     write_markdown_file(output_dir / "report_monk_intra_operator.md", build_monk_intra_markdown(df, intra_df))
     write_markdown_file(output_dir / "report_monk_pairwise_summary.md", build_pairwise_markdown(summary_df))
@@ -760,13 +808,14 @@ def analyze_monk(files: list[Path], output_dir: Path) -> None:
 
 def analyze_ella(files: list[Path], output_dir: Path) -> None:
     df = load_ella_data(files)
-    summary_df = summarize_ella_intra_operator(df)
     plot_path = output_dir / "ella_intra_operator_variation.png"
+    summary_path = output_dir / "ella_intra_operator_summary.csv"
 
     write_preprocessed_data(df, output_dir / "ella_preprocessed_measurements.csv")
-    summary_df.to_csv(output_dir / "ella_intra_operator_summary.csv", index=False)
+    if summary_path.exists():
+        summary_path.unlink()
     make_ella_intra_plot(df, plot_path)
-    write_markdown_file(output_dir / "report_ella_intra_operator.md", build_ella_intra_markdown(summary_df, plot_path))
+    write_markdown_file(output_dir / "report_ella_intra_operator.md", build_ella_intra_markdown(plot_path))
 
 
 def main() -> None:
@@ -780,7 +829,7 @@ def main() -> None:
     ella_input = ella_files(files)
 
     if not participant_input:
-        raise ValueError("No participant files were found after excluding Monk Scale and Ella files.")
+        raise ValueError("No participant files were found with 'Subject' in the filename.")
     if not monk_input:
         raise ValueError("No Monk Scale files were found.")
     if not ella_input:
