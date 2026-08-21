@@ -45,8 +45,8 @@ The Bland-Altman plots below show pairwise agreement by rater pair, with points 
 
 {{< include results/analysis/report_monk_bland_altman.md >}}
 
-# Ella Measurements
+# Triplicates
 
 ## Intra-operator Variation
 
-{{< include results/analysis/report_ella_intra_operator.md >}}
+{{< include results/analysis/report_triplicates_intra_operator.md >}}

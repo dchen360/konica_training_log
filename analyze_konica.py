@@ -20,6 +20,7 @@ DATE_PATTERN = re.compile(r"(?P<month>\d{1,2})-(?P<day>\d{1,2})-(?P<year>\d{2,4}
 SID_PATTERN = re.compile(r"SID\s*([0-9]{3,4})", re.IGNORECASE)
 LEGACY_SUBJECT_ID_PATTERN = re.compile(r"Subject\s+\d+\s+\(([0-9]{3,4})\)", re.IGNORECASE)
 OPERATOR_SUFFIX_PATTERN = re.compile(r"(KH|EB|RVZ|LER)\)?(?:\s*\(\d+\))?\s*$", re.IGNORECASE)
+TRIPLICATE_FILENAME_PATTERN = re.compile(r"Subject\s*(\d+)_(EB|KH|RVZ)_(\d+)$", re.IGNORECASE)
 REQUIRED_RAW_COLUMNS = ("Group", "L*", "b*")
 BODY_SITE_NORMALIZATION = {
     "Palmer": "Palmar",
@@ -37,6 +38,7 @@ BODY_SITE_MARKERS = {
     "Forehead": "P",
     "Palmar": "X",
 }
+TRIPLICATE_OPERATOR_ORDER = ["EB", "KH", "RVZ"]
 MONK_GROUP_ORDER = list("ABCDEFGHIJ")
 MONK_COLORS = {
     "A": "#f7ede4",
@@ -229,7 +231,7 @@ def select_median_ita_rows(df: pd.DataFrame, group_columns: list[str]) -> pd.Dat
 
 
 def participant_files(files: list[Path]) -> list[Path]:
-    return [file for file in files if "subject" in file.name.lower()]
+    return [file for file in files if "subject" in file.name.lower() and "triplicates" not in file.parts]
 
 
 def participant_reference_rater(raters: list[str]) -> str:
@@ -279,11 +281,55 @@ def ella_files(files: list[Path]) -> list[Path]:
     return selected
 
 
+def triplicates_files(files: list[Path]) -> list[Path]:
+    return [file for file in files if "triplicates" in file.parts and TRIPLICATE_FILENAME_PATTERN.search(file.stem)]
+
+
 def load_participant_data(files: list[Path]) -> pd.DataFrame:
     frames = [load_single_raw_file(file, include_participant=True) for file in files]
     combined = pd.concat(frames, ignore_index=True)
     combined = combined[combined["body_site"].isin(PARTICIPANT_BODY_SITE_ORDER)].copy()
     return select_median_ita_rows(combined, ["body_site", "Date", "SID", "operator"])
+
+
+def extract_triplicates_metadata(path: Path) -> tuple[str, str, int]:
+    match = TRIPLICATE_FILENAME_PATTERN.search(path.stem)
+    if not match:
+        raise ValueError(f"Could not extract triplicates metadata from filename: {path.name}")
+    subject = f"Subject{int(match.group(1))}"
+    operator = match.group(2).upper()
+    repeat_version = int(match.group(3))
+    return subject, operator, repeat_version
+
+
+def load_triplicates_data(files: list[Path]) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for file in files:
+        subject, operator, repeat_version = extract_triplicates_metadata(file)
+        df = pd.read_csv(file)
+        missing = [column for column in REQUIRED_RAW_COLUMNS if column not in df.columns]
+        if missing:
+            raise ValueError(f"{file.name} is missing required columns: {', '.join(missing)}")
+
+        trip = df.copy()
+        trip["source_file"] = file.name
+        trip["subject"] = subject
+        trip["participant"] = subject
+        trip["operator"] = operator
+        trip["rater"] = operator
+        trip["repeat_version"] = repeat_version
+        trip["body_site"] = trip["Group"].astype(str).str.strip().replace(BODY_SITE_NORMALIZATION)
+        trip["L*"] = pd.to_numeric(trip["L*"], errors="coerce")
+        trip["b*"] = pd.to_numeric(trip["b*"], errors="coerce")
+        trip = trip.dropna(subset=["body_site", "L*", "b*"])
+        trip = trip[trip["body_site"].isin(PARTICIPANT_BODY_SITE_ORDER)].copy()
+        trip["ita"] = trip.apply(lambda row: compute_ita(row["L*"], row["b*"]), axis=1)
+        frames.append(trip)
+
+    combined = pd.concat(frames, ignore_index=True)
+    reduced = select_median_ita_rows(combined, ["body_site", "subject", "operator", "repeat_version"])
+    reduced["body_site"] = pd.Categorical(reduced["body_site"], categories=PARTICIPANT_BODY_SITE_ORDER, ordered=True)
+    return reduced.sort_values(["subject", "body_site", "operator", "repeat_version"]).reset_index(drop=True)
 
 
 def load_monk_data(files: list[Path]) -> pd.DataFrame:
@@ -724,6 +770,128 @@ def build_ella_intra_markdown(plot_path: Path) -> str:
     )
 
 
+def summarize_triplicates_intra_operator(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    cell_df = (
+        df.groupby(["subject", "body_site", "operator"])
+        .agg(
+            n_repeats=("measurement", "size"),
+            mean_median_ita=("measurement", "mean"),
+            cell_sd=("measurement", "std"),
+        )
+        .reset_index()
+        .sort_values(["subject", "body_site", "operator"])
+        .reset_index(drop=True)
+    )
+
+    summary_rows: list[dict] = []
+    for operator, operator_df in cell_df.groupby("operator"):
+        valid = operator_df["cell_sd"].dropna()
+        pooled_within_sd = float(np.sqrt(np.mean(np.square(valid)))) if not valid.empty else np.nan
+        repeatability = 1.96 * np.sqrt(2) * pooled_within_sd if pd.notna(pooled_within_sd) else np.nan
+        summary_rows.append(
+            {
+                "operator": operator,
+                "n_cells": int(operator_df["cell_sd"].notna().sum()),
+                "pooled_within_sd": pooled_within_sd,
+                "repeatability_coefficient": repeatability,
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows)
+    if not summary_df.empty:
+        summary_df["operator"] = pd.Categorical(
+            summary_df["operator"], categories=TRIPLICATE_OPERATOR_ORDER, ordered=True
+        )
+        summary_df = summary_df.sort_values("operator").reset_index(drop=True)
+
+    return cell_df, summary_df
+
+
+def build_triplicates_flagged_cells(df: pd.DataFrame, cell_df: pd.DataFrame, threshold: float = 5.0) -> pd.DataFrame:
+    wide = (
+        df.pivot_table(
+            index=["subject", "body_site", "operator"],
+            columns="repeat_version",
+            values="measurement",
+            aggfunc="first",
+        )
+        .reset_index()
+    )
+    version_numbers = [int(column) for column in wide.columns if isinstance(column, (int, np.integer))]
+    version_columns = {column: f"median_ita_v{int(column)}" for column in wide.columns if isinstance(column, (int, np.integer))}
+    wide = wide.rename(columns=version_columns)
+    flagged = cell_df[cell_df["cell_sd"] > threshold].copy()
+    if flagged.empty:
+        return flagged
+
+    merged = flagged.merge(wide, on=["subject", "body_site", "operator"], how="left")
+    version_labels = [f"median_ita_v{version}" for version in sorted(version_numbers)]
+    desired_columns = ["subject", "body_site", "operator", "cell_sd", *version_labels]
+    present_columns = [column for column in desired_columns if column in merged.columns]
+    return merged[present_columns].sort_values(["subject", "body_site", "operator"]).reset_index(drop=True)
+
+
+def make_triplicates_heatmap(cell_df: pd.DataFrame, output_path: Path) -> None:
+    heatmap_df = cell_df.copy()
+    heatmap_df["body_site"] = pd.Categorical(
+        heatmap_df["body_site"], categories=PARTICIPANT_BODY_SITE_ORDER, ordered=True
+    )
+    subject_order = sorted(heatmap_df["subject"].unique(), key=lambda value: int(re.search(r"\d+", value).group(0)))
+    heatmap_df["subject"] = pd.Categorical(heatmap_df["subject"], categories=subject_order, ordered=True)
+    heatmap_df = heatmap_df.sort_values(["subject", "body_site", "operator"]).reset_index(drop=True)
+    heatmap_df["subject_group"] = heatmap_df["subject"].astype(str) + " | " + heatmap_df["body_site"].astype(str)
+
+    matrix = (
+        heatmap_df.pivot(index="subject_group", columns="operator", values="cell_sd")
+        .reindex(columns=TRIPLICATE_OPERATOR_ORDER)
+    )
+    annot = matrix.apply(lambda column: column.map(lambda value: "" if pd.isna(value) else f"{value:.2f}"))
+
+    fig_height = max(4.5, len(matrix) * 0.45)
+    fig, ax = plt.subplots(figsize=(6.5, fig_height))
+    sns.heatmap(
+        matrix,
+        annot=annot,
+        fmt="",
+        cmap="YlOrRd",
+        linewidths=0.5,
+        linecolor="white",
+        cbar_kws={"label": "SD of median ITA"},
+        ax=ax,
+    )
+    ax.set_xlabel("Operator", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Subject | Body site", fontsize=12, fontweight="bold")
+    ax.tick_params(axis="x", rotation=0)
+    ax.tick_params(axis="y", rotation=0)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def build_triplicates_markdown(summary_df: pd.DataFrame, heatmap_path: Path, flagged_df: pd.DataFrame) -> str:
+    lines = [
+        "Each triplicates file is first reduced to one median ITA per body site.",
+        "For each Subject x Body site x Operator cell, the SD is then calculated from the 3 session-level median ITA values.",
+        "The operator-specific pooled within-SD is `sqrt(mean(cell SD^2))`, and the repeatability coefficient is `1.96 * sqrt(2) * pooled within-SD`.",
+        "",
+        markdown_table(summary_df, digits=3),
+        "",
+        f"![]({heatmap_path.as_posix()})",
+    ]
+    if flagged_df.empty:
+        lines.extend(["", "No Subject x Body site x Operator cells had SD of median ITA greater than 5."])
+    else:
+        lines.extend(
+            [
+                "",
+                "## Cells With SD of Median ITA Greater Than 5",
+                "",
+                markdown_table(flagged_df, digits=3),
+            ]
+        )
+    return "\n".join(lines)
+
+
 def analyze_participants(files: list[Path], output_dir: Path) -> None:
     df = load_participant_data(files)
     raters = sorted(df["rater"].unique())
@@ -818,6 +986,23 @@ def analyze_ella(files: list[Path], output_dir: Path) -> None:
     write_markdown_file(output_dir / "report_ella_intra_operator.md", build_ella_intra_markdown(plot_path))
 
 
+def analyze_triplicates(files: list[Path], output_dir: Path) -> None:
+    df = load_triplicates_data(files)
+    cell_df, summary_df = summarize_triplicates_intra_operator(df)
+    flagged_df = build_triplicates_flagged_cells(df, cell_df, threshold=5.0)
+    heatmap_path = output_dir / "triplicates_intra_operator_heatmap.png"
+
+    write_preprocessed_data(df, output_dir / "triplicates_preprocessed_measurements.csv")
+    cell_df.to_csv(output_dir / "triplicates_cell_level_sd.csv", index=False)
+    summary_df.to_csv(output_dir / "triplicates_operator_summary.csv", index=False)
+    flagged_df.to_csv(output_dir / "triplicates_flagged_cells_sd_gt_5.csv", index=False)
+    make_triplicates_heatmap(cell_df, heatmap_path)
+    write_markdown_file(
+        output_dir / "report_triplicates_intra_operator.md",
+        build_triplicates_markdown(summary_df, heatmap_path, flagged_df),
+    )
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -827,6 +1012,7 @@ def main() -> None:
     participant_input = participant_files(files)
     monk_input = monk_files(files)
     ella_input = ella_files(files)
+    triplicates_input = triplicates_files(files)
 
     if not participant_input:
         raise ValueError("No participant files were found with 'Subject' in the filename.")
@@ -834,10 +1020,13 @@ def main() -> None:
         raise ValueError("No Monk Scale files were found.")
     if not ella_input:
         raise ValueError("No Ella EB files were found.")
+    if not triplicates_input:
+        raise ValueError("No triplicates files were found.")
 
     analyze_participants(participant_input, args.output_dir)
     analyze_monk(monk_input, args.output_dir)
     analyze_ella(ella_input, args.output_dir)
+    analyze_triplicates(triplicates_input, args.output_dir)
 
 
 if __name__ == "__main__":
