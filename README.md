@@ -56,10 +56,11 @@ Run the analysis on a folder of raw participant files:
 uv run python analyze_konica.py data
 ```
 
-Render the HTML report:
+Render the HTML reports:
 
 ```bash
-quarto render report.qmd --to html --output-dir results/report
+quarto render ucsf_lab.qmd --to html --output-dir results/report
+quarto render uganda_lab.qmd --to html --output-dir results/report
 ```
 
 ## Outputs
@@ -72,4 +73,4 @@ The script writes analysis outputs into `results/analysis/` by default:
 - `pairwise_difference_summary.csv`
 - `bland_altman_<rater1>_vs_<rater2>.png`
 
-The Quarto report can be rendered into `results/report/`.
+The Quarto reports can be rendered into `results/report/`.

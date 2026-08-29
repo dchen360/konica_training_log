@@ -1,0 +1,27 @@
+---
+title: "Previous KM Comparisons"
+toc: true
+number-sections: true
+format:
+  html:
+    theme: cosmo
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+---
+
+# Fred vs Ronald
+
+## Inter-operator Analysis
+
+{{< include results/analysis/report_fred_inter_operator.md >}}
+
+# EquiOx CRCs
+
+## Inter-operator Analysis
+
+{{< include results/analysis/report_equiox_inter_operator.md >}}
+
+## Condition Comparisons
+
+{{< include results/analysis/report_equiox_variable_change.md >}}

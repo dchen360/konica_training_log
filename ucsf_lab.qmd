@@ -7,6 +7,7 @@ format:
     theme: cosmo
     toc-depth: 3
     code-fold: false
+    embed-resources: true
 ---
 
 # Study Participants

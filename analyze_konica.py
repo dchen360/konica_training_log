@@ -4,7 +4,9 @@ import argparse
 import hashlib
 import itertools
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from zipfile import ZipFile
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -15,30 +17,59 @@ import statsmodels.api as sm
 import statsmodels.formula.api as smf
 
 
-RATER_PATTERN = re.compile(r"(?<![A-Za-z])(KH|EB|RVZ|LER)(?![A-Za-z])", re.IGNORECASE)
+RATER_PATTERN = re.compile(r"(?<![A-Za-z])(KH|EB|RVZ|LER|PE)(?![A-Za-z])", re.IGNORECASE)
 DATE_PATTERN = re.compile(r"(?P<month>\d{1,2})-(?P<day>\d{1,2})-(?P<year>\d{2,4})")
 SID_PATTERN = re.compile(r"SID\s*([0-9]{3,4})", re.IGNORECASE)
 LEGACY_SUBJECT_ID_PATTERN = re.compile(r"Subject\s+\d+\s+\(([0-9]{3,4})\)", re.IGNORECASE)
-OPERATOR_SUFFIX_PATTERN = re.compile(r"(KH|EB|RVZ|LER)\)?(?:\s*\(\d+\))?\s*$", re.IGNORECASE)
+OPERATOR_SUFFIX_PATTERN = re.compile(r"(KH|EB|RVZ|LER|PE)\)?(?:\s*\(\d+\))?\s*$", re.IGNORECASE)
 TRIPLICATE_FILENAME_PATTERN = re.compile(r"Subject\s*(\d+)_(EB|KH|RVZ)_(\d+)$", re.IGNORECASE)
+UGANDA_FILENAME_PATTERN = re.compile(r"Subject\s*(\d+)_(EB|PE)_(\d+)$", re.IGNORECASE)
 REQUIRED_RAW_COLUMNS = ("Group", "L*", "b*")
 BODY_SITE_NORMALIZATION = {
     "Palmer": "Palmar",
     "Arm": "Inner Upper Arm",
     "Arms": "Inner Upper Arm",
     "Inner arm": "Inner Upper Arm",
+    "Inner upper arm": "Inner Upper Arm",
+    "Inner upperarm": "Inner Upper Arm",
+    "Back of hand": "Back of Hand",
+    "Fingernail (A)": "Fingernail",
+    "Dorsal (B)": "Dorsal",
+    "Dorsal - DIP (B)": "Dorsal",
+    "Palmar (C)": "Palmar",
+    "Inner Arn (D)": "Inner Upper Arm",
+    "Inner Upper Arm (D)": "Inner Upper Arm",
+    "Forehead (E)": "Forehead",
+    "Forehead (G)": "Forehead",
 }
 PARTICIPANT_BODY_SITE_ORDER = ["Inner Upper Arm", "Dorsal", "Forehead", "Palmar"]
+UGANDA_BODY_SITE_ORDER = ["Inner Upper Arm", "Dorsal", "Forehead", "Back of Hand", "Palmar"]
+PREVIOUS_KM_BODY_SITE_ORDER = ["Fingernail", "Dorsal", "Inner Upper Arm", "Forehead", "Palmar"]
+EQUIOX_BODY_SITE_ORDER = ["Dorsal", "Inner Upper Arm", "Forehead"]
 BODY_SITE_PLOT_ORDER = ["Arm", "Chest", "Dorsal", "Ear", "Forehead", "Palmar"]
 BODY_SITE_MARKERS = {
+    "Fingernail": "o",
     "Inner Upper Arm": "o",
     "Chest": "s",
     "Dorsal": "^",
+    "Back of Hand": "D",
     "Ear": "D",
     "Forehead": "P",
     "Palmar": "X",
 }
+BODY_SITE_COLORS = {
+    "Fingernail": "#4daf4a",
+    "Inner Upper Arm": "#1f78b4",
+    "Dorsal": "#e31a1c",
+    "Forehead": "#33a02c",
+    "Back of Hand": "#ff7f00",
+    "Palmar": "#6a3d9a",
+}
 TRIPLICATE_OPERATOR_ORDER = ["EB", "KH", "RVZ"]
+UGANDA_OPERATOR_ORDER = ["EB", "PE"]
+FRED_OPERATOR_ORDER = ["RB", "FB"]
+EQUIOX_INTER_OPERATOR_ORDER = ["CC", "EB", "LO", "RVZ", "SE"]
+EQUIOX_VARIABLE_CHANGE_ORDER = ["Control", "Pressure: Hard", "Lifiting"]
 MONK_GROUP_ORDER = list("ABCDEFGHIJ")
 MONK_COLORS = {
     "A": "#f7ede4",
@@ -64,6 +95,9 @@ ELLA_PARTICIPANT_MARKERS = {
     "Lily": "s",
     "Katie": "^",
 }
+FRED_FILENAME_PATTERN = re.compile(r"(.+?)_(rb|fb)_([a-z]+)$", re.IGNORECASE)
+EQUIOX_TEST_FILENAME_PATTERN = re.compile(r"Test\s+(\d+)$", re.IGNORECASE)
+XLSX_NS = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Analyze Konica Minolta participant, Monk Scale, and Ella datasets."
@@ -173,6 +207,46 @@ def safe_slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").lower()
 
 
+def read_simple_xlsx_rows(path: Path) -> list[dict[str, str]]:
+    with ZipFile(path) as workbook:
+        shared_strings: list[str] = []
+        shared_path = "xl/sharedStrings.xml"
+        if shared_path in workbook.namelist():
+            root = ET.fromstring(workbook.read(shared_path))
+            for item in root.findall("a:si", XLSX_NS):
+                shared_strings.append("".join(text.text or "" for text in item.findall(".//a:t", XLSX_NS)))
+
+        root = ET.fromstring(workbook.read("xl/worksheets/sheet1.xml"))
+        sheet_rows = root.findall(".//a:sheetData/a:row", XLSX_NS)
+        records: list[dict[str, str]] = []
+        headers: list[str] = []
+        expected_columns = ["A", "B", "C", "D", "E", "F", "G"]
+
+        for row_index, row in enumerate(sheet_rows):
+            values: dict[str, str] = {}
+            for cell in row.findall("a:c", XLSX_NS):
+                cell_ref = cell.get("r", "")
+                column = "".join(character for character in cell_ref if character.isalpha())
+                cell_type = cell.get("t")
+                raw_value = cell.find("a:v", XLSX_NS)
+                value = ""
+                if cell_type == "s" and raw_value is not None:
+                    value = shared_strings[int(raw_value.text)]
+                elif raw_value is not None and raw_value.text is not None:
+                    value = raw_value.text
+                values[column] = value
+
+            ordered_values = [values.get(column, "") for column in expected_columns]
+            if row_index == 0:
+                headers = ordered_values
+                continue
+            record = dict(zip(headers, ordered_values))
+            if record.get("Test"):
+                records.append(record)
+
+    return records
+
+
 def compute_ita(l_value: float, b_value: float) -> float:
     if pd.isna(l_value) or pd.isna(b_value) or b_value == 0:
         return np.nan
@@ -231,7 +305,12 @@ def select_median_ita_rows(df: pd.DataFrame, group_columns: list[str]) -> pd.Dat
 
 
 def participant_files(files: list[Path]) -> list[Path]:
-    return [file for file in files if "subject" in file.name.lower() and "triplicates" not in file.parts]
+    excluded_directories = {"triplicates", "Ella and Philip ITA Repeatability"}
+    return [
+        file
+        for file in files
+        if "subject" in file.name.lower() and not any(directory in file.parts for directory in excluded_directories)
+    ]
 
 
 def participant_reference_rater(raters: list[str]) -> str:
@@ -285,6 +364,30 @@ def triplicates_files(files: list[Path]) -> list[Path]:
     return [file for file in files if "triplicates" in file.parts and TRIPLICATE_FILENAME_PATTERN.search(file.stem)]
 
 
+def uganda_files(files: list[Path]) -> list[Path]:
+    return [
+        file
+        for file in files
+        if "Ella and Philip ITA Repeatability" in file.parts and UGANDA_FILENAME_PATTERN.search(file.stem)
+    ]
+
+
+def fred_files(files: list[Path]) -> list[Path]:
+    return [
+        file
+        for file in files
+        if "Fred and Ronald ITA Repeatability" in file.parts and FRED_FILENAME_PATTERN.search(file.stem)
+    ]
+
+
+def equiox_files(files: list[Path]) -> list[Path]:
+    return [
+        file
+        for file in files
+        if "EquiOx ITA Repeatability" in file.parts and EQUIOX_TEST_FILENAME_PATTERN.search(file.stem)
+    ]
+
+
 def load_participant_data(files: list[Path]) -> pd.DataFrame:
     frames = [load_single_raw_file(file, include_participant=True) for file in files]
     combined = pd.concat(frames, ignore_index=True)
@@ -302,10 +405,20 @@ def extract_triplicates_metadata(path: Path) -> tuple[str, str, int]:
     return subject, operator, repeat_version
 
 
-def load_triplicates_data(files: list[Path]) -> pd.DataFrame:
+def load_repeatability_data(
+    files: list[Path],
+    *,
+    filename_pattern: re.Pattern[str],
+    body_site_order: list[str],
+) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for file in files:
-        subject, operator, repeat_version = extract_triplicates_metadata(file)
+        match = filename_pattern.search(file.stem)
+        if not match:
+            raise ValueError(f"Could not extract repeatability metadata from filename: {file.name}")
+        subject = f"Subject{int(match.group(1))}"
+        operator = match.group(2).upper()
+        repeat_version = int(match.group(3))
         df = pd.read_csv(file)
         missing = [column for column in REQUIRED_RAW_COLUMNS if column not in df.columns]
         if missing:
@@ -322,14 +435,123 @@ def load_triplicates_data(files: list[Path]) -> pd.DataFrame:
         trip["L*"] = pd.to_numeric(trip["L*"], errors="coerce")
         trip["b*"] = pd.to_numeric(trip["b*"], errors="coerce")
         trip = trip.dropna(subset=["body_site", "L*", "b*"])
-        trip = trip[trip["body_site"].isin(PARTICIPANT_BODY_SITE_ORDER)].copy()
+        trip = trip[trip["body_site"].isin(body_site_order)].copy()
         trip["ita"] = trip.apply(lambda row: compute_ita(row["L*"], row["b*"]), axis=1)
         frames.append(trip)
 
     combined = pd.concat(frames, ignore_index=True)
     reduced = select_median_ita_rows(combined, ["body_site", "subject", "operator", "repeat_version"])
-    reduced["body_site"] = pd.Categorical(reduced["body_site"], categories=PARTICIPANT_BODY_SITE_ORDER, ordered=True)
+    reduced["body_site"] = pd.Categorical(reduced["body_site"], categories=body_site_order, ordered=True)
     return reduced.sort_values(["subject", "body_site", "operator", "repeat_version"]).reset_index(drop=True)
+
+
+def load_triplicates_data(files: list[Path]) -> pd.DataFrame:
+    return load_repeatability_data(
+        files,
+        filename_pattern=TRIPLICATE_FILENAME_PATTERN,
+        body_site_order=PARTICIPANT_BODY_SITE_ORDER,
+    )
+
+
+def load_uganda_data(files: list[Path]) -> pd.DataFrame:
+    return load_repeatability_data(
+        files,
+        filename_pattern=UGANDA_FILENAME_PATTERN,
+        body_site_order=UGANDA_BODY_SITE_ORDER,
+    )
+
+
+def load_fred_data(files: list[Path]) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for file in files:
+        match = FRED_FILENAME_PATTERN.match(file.stem)
+        if not match:
+            continue
+        test_id, operator, subject = match.groups()
+        operator = operator.upper()
+        if operator not in {"RB", "FB"}:
+            continue
+        df = pd.read_csv(file)
+        missing = [column for column in REQUIRED_RAW_COLUMNS if column not in df.columns]
+        if missing:
+            raise ValueError(f"{file.name} is missing required columns: {', '.join(missing)}")
+
+        fred = df.copy()
+        fred["source_file"] = file.name
+        fred["subject"] = subject.upper()
+        fred["participant"] = subject.upper()
+        fred["operator"] = operator
+        fred["rater"] = operator
+        fred["test_id"] = test_id
+        fred["body_site"] = fred["Group"].astype(str).str.strip().replace(BODY_SITE_NORMALIZATION)
+        fred["L*"] = pd.to_numeric(fred["L*"], errors="coerce")
+        fred["b*"] = pd.to_numeric(fred["b*"], errors="coerce")
+        fred = fred.dropna(subset=["body_site", "L*", "b*"])
+        fred = fred[fred["body_site"].isin(PREVIOUS_KM_BODY_SITE_ORDER)].copy()
+        fred["ita"] = fred.apply(lambda row: compute_ita(row["L*"], row["b*"]), axis=1)
+        frames.append(fred)
+
+    combined = pd.concat(frames, ignore_index=True)
+    reduced = select_median_ita_rows(combined, ["body_site", "subject", "operator", "test_id"])
+    reduced["body_site"] = pd.Categorical(reduced["body_site"], categories=PREVIOUS_KM_BODY_SITE_ORDER, ordered=True)
+    reduced = reduced.sort_values(["subject", "body_site", "operator"]).reset_index(drop=True)
+    paired_subjects = (
+        reduced.groupby("subject")["operator"].nunique().loc[lambda series: series >= 2].index.tolist()
+    )
+    return reduced[reduced["subject"].isin(paired_subjects)].reset_index(drop=True)
+
+
+def load_equiox_data(files: list[Path], metadata_path: Path) -> pd.DataFrame:
+    metadata_rows = read_simple_xlsx_rows(metadata_path)
+    metadata_by_test: dict[int, dict[str, str]] = {}
+    for row in metadata_rows:
+        test_id = int(float(row["Test"]))
+        metadata_by_test[test_id] = {
+            "subject": row["Subject"].strip().upper(),
+            "operator": row["Operator"].strip().upper(),
+            "pressure": row["Pressure"].strip(),
+            "lifting": row["Lifting"].strip(),
+            "condition": row["Variable Changes (compares to Control)"].strip(),
+            "date_label": row["Date / Time"].strip(),
+        }
+
+    frames: list[pd.DataFrame] = []
+    for file in files:
+        match = EQUIOX_TEST_FILENAME_PATTERN.search(file.stem)
+        if not match:
+            continue
+        test_id = int(match.group(1))
+        if test_id not in metadata_by_test:
+            continue
+        metadata = metadata_by_test[test_id]
+        df = pd.read_csv(file)
+        missing = [column for column in REQUIRED_RAW_COLUMNS if column not in df.columns]
+        if missing:
+            raise ValueError(f"{file.name} is missing required columns: {', '.join(missing)}")
+
+        equiox = df.copy()
+        equiox["source_file"] = file.name
+        equiox["test_id"] = test_id
+        equiox["subject"] = metadata["subject"]
+        equiox["participant"] = metadata["subject"]
+        equiox["operator"] = metadata["operator"]
+        equiox["rater"] = metadata["operator"]
+        equiox["pressure"] = metadata["pressure"]
+        equiox["lifting"] = metadata["lifting"]
+        equiox["condition"] = metadata["condition"]
+        equiox["date_label"] = metadata["date_label"]
+        equiox["body_site"] = equiox["Group"].astype(str).str.strip().replace(BODY_SITE_NORMALIZATION)
+        equiox["L*"] = pd.to_numeric(equiox["L*"], errors="coerce")
+        equiox["b*"] = pd.to_numeric(equiox["b*"], errors="coerce")
+        equiox = equiox.dropna(subset=["body_site", "L*", "b*"])
+        equiox = equiox[equiox["body_site"].isin(PREVIOUS_KM_BODY_SITE_ORDER)].copy()
+        equiox["ita"] = equiox.apply(lambda row: compute_ita(row["L*"], row["b*"]), axis=1)
+        frames.append(equiox)
+
+    combined = pd.concat(frames, ignore_index=True)
+    reduced = select_median_ita_rows(combined, ["body_site", "test_id", "subject", "operator", "condition"])
+    reduced["body_site"] = pd.Categorical(reduced["body_site"], categories=PREVIOUS_KM_BODY_SITE_ORDER, ordered=True)
+    return reduced.sort_values(["test_id", "body_site", "operator"]).reset_index(drop=True)
 
 
 def load_monk_data(files: list[Path]) -> pd.DataFrame:
@@ -470,6 +692,7 @@ def make_bland_altman_plots(
     style_column: str | None = None,
     markers: dict[str, str] | None = None,
     legend_kwargs: dict | None = None,
+    annotate_column: str | None = None,
 ) -> None:
     sns.set_theme(style="whitegrid")
     for stale_path in output_dir.glob(f"{filename_prefix}_*.png"):
@@ -513,6 +736,17 @@ def make_bland_altman_plots(
         if markers is not None:
             scatter_kwargs["markers"] = markers
         sns.scatterplot(**scatter_kwargs)
+
+        if annotate_column is not None:
+            for _, row in plot_df.iterrows():
+                ax.annotate(
+                    str(row[annotate_column]),
+                    (row["mean_measurement"], row["difference"]),
+                    xytext=(4, 4),
+                    textcoords="offset points",
+                    fontsize=8,
+                    alpha=0.8,
+                )
 
         ax.axhline(bias, color="black", linestyle="-", linewidth=1.5, label="Bias")
         ax.axhline(loa_lower, color="firebrick", linestyle="--", linewidth=1.2, label="Lower LoA")
@@ -606,7 +840,7 @@ def markdown_table(df: pd.DataFrame, digits: int = 3) -> str:
             formatted[column] = formatted[column].map(lambda value: "" if pd.isna(value) else f"{value:.{digits}f}")
 
     headers = [format_display_label(str(column)) for column in formatted.columns]
-    rows = formatted.astype(str).values.tolist()
+    rows = [[str(value) for value in row] for row in formatted.astype(object).values.tolist()]
     widths = [len(header) for header in headers]
     for row in rows:
         for idx, value in enumerate(row):
@@ -770,7 +1004,11 @@ def build_ella_intra_markdown(plot_path: Path) -> str:
     )
 
 
-def summarize_triplicates_intra_operator(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def summarize_triplicates_intra_operator(
+    df: pd.DataFrame,
+    *,
+    operator_order: list[str] = TRIPLICATE_OPERATOR_ORDER,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     cell_df = (
         df.groupby(["subject", "body_site", "operator"])
         .agg(
@@ -799,9 +1037,7 @@ def summarize_triplicates_intra_operator(df: pd.DataFrame) -> tuple[pd.DataFrame
 
     summary_df = pd.DataFrame(summary_rows)
     if not summary_df.empty:
-        summary_df["operator"] = pd.Categorical(
-            summary_df["operator"], categories=TRIPLICATE_OPERATOR_ORDER, ordered=True
-        )
+        summary_df["operator"] = pd.Categorical(summary_df["operator"], categories=operator_order, ordered=True)
         summary_df = summary_df.sort_values("operator").reset_index(drop=True)
 
     return cell_df, summary_df
@@ -868,6 +1104,46 @@ def make_triplicates_heatmap(cell_df: pd.DataFrame, output_path: Path) -> None:
     plt.close(fig)
 
 
+def make_repeatability_heatmap(
+    cell_df: pd.DataFrame,
+    *,
+    output_path: Path,
+    body_site_order: list[str],
+    operator_order: list[str],
+) -> None:
+    heatmap_df = cell_df.copy()
+    heatmap_df["body_site"] = pd.Categorical(
+        heatmap_df["body_site"], categories=body_site_order, ordered=True
+    )
+    subject_order = sorted(heatmap_df["subject"].unique(), key=lambda value: int(re.search(r"\d+", value).group(0)))
+    heatmap_df["subject"] = pd.Categorical(heatmap_df["subject"], categories=subject_order, ordered=True)
+    heatmap_df = heatmap_df.sort_values(["subject", "body_site", "operator"]).reset_index(drop=True)
+    heatmap_df["subject_group"] = heatmap_df["subject"].astype(str) + " | " + heatmap_df["body_site"].astype(str)
+
+    matrix = heatmap_df.pivot(index="subject_group", columns="operator", values="cell_sd").reindex(columns=operator_order)
+    annot = matrix.apply(lambda column: column.map(lambda value: "" if pd.isna(value) else f"{value:.2f}"))
+
+    fig_height = max(4.5, len(matrix) * 0.45)
+    fig, ax = plt.subplots(figsize=(6.5, fig_height))
+    sns.heatmap(
+        matrix,
+        annot=annot,
+        fmt="",
+        cmap="YlOrRd",
+        linewidths=0.5,
+        linecolor="white",
+        cbar_kws={"label": "SD of median ITA"},
+        ax=ax,
+    )
+    ax.set_xlabel("Operator", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Subject | Body site", fontsize=12, fontweight="bold")
+    ax.tick_params(axis="x", rotation=0)
+    ax.tick_params(axis="y", rotation=0)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def build_triplicates_markdown(summary_df: pd.DataFrame, heatmap_path: Path, flagged_df: pd.DataFrame) -> str:
     lines = [
         "Each triplicates file is first reduced to one median ITA per body site.",
@@ -890,6 +1166,146 @@ def build_triplicates_markdown(summary_df: pd.DataFrame, heatmap_path: Path, fla
             ]
         )
     return "\n".join(lines)
+
+
+def build_uganda_intra_markdown(summary_df: pd.DataFrame, heatmap_path: Path, flagged_df: pd.DataFrame) -> str:
+    lines = [
+        markdown_table(summary_df, digits=3),
+        "",
+        f"![]({heatmap_path.as_posix()})",
+    ]
+    if flagged_df.empty:
+        lines.extend(["", "No Subject x Body site x Operator cells had SD of median ITA greater than 5."])
+    else:
+        lines.extend(
+            [
+                "",
+                "## Cells With SD of Median ITA Greater Than 5",
+                "",
+                markdown_table(flagged_df, digits=3),
+            ]
+        )
+    return "\n".join(lines)
+
+
+def build_uganda_inter_markdown(summary_df: pd.DataFrame, output_dir: Path) -> str:
+    by_site_df = summary_df[summary_df["body_site"] != "Overall"].reset_index(drop=True)
+    lines = [
+        markdown_table(by_site_df, digits=3),
+        "",
+        build_bland_altman_markdown(output_dir, "uganda_bland_altman").rstrip(),
+    ]
+    return "\n".join(lines)
+
+
+def build_uganda_raw_data_markdown(df: pd.DataFrame) -> str:
+    raw_df = df.copy()
+    raw_df["subject_sort"] = raw_df["subject"].str.extract(r"(\d+)").astype(int)
+    raw_df = raw_df.sort_values(["subject_sort", "body_site", "operator", "repeat_version"]).reset_index(drop=True)
+    display_df = raw_df[
+        ["subject", "operator", "repeat_version", "body_site", "L*", "a*", "b*", "measurement"]
+    ].rename(
+        columns={
+            "subject": "Subject #",
+            "operator": "Operator",
+            "repeat_version": "Round #",
+            "body_site": "Group",
+            "L*": "L*",
+            "a*": "a*",
+            "b*": "b*",
+            "measurement": "ITA",
+        }
+    )
+    return markdown_table(display_df, digits=3)
+
+
+def summarize_uganda_inter_operator(pairwise_df: pd.DataFrame) -> pd.DataFrame:
+    by_site = summarize_pairwise_differences(pairwise_df, ["body_site", "rater_pair"])
+    overall = (
+        pairwise_df.groupby("rater_pair")
+        .agg(
+            n_pairs=("difference", "size"),
+            mean_difference=("difference", "mean"),
+            sd_difference=("difference", "std"),
+        )
+        .reset_index()
+    )
+    overall.insert(0, "body_site", "Overall")
+    summary_df = pd.concat([overall, by_site], ignore_index=True)
+    summary_df["body_site"] = pd.Categorical(
+        summary_df["body_site"],
+        categories=["Overall", *UGANDA_BODY_SITE_ORDER],
+        ordered=True,
+    )
+    return summary_df.sort_values(["body_site", "rater_pair"]).reset_index(drop=True)
+
+
+def collapse_uganda_inter_operator(df: pd.DataFrame) -> pd.DataFrame:
+    collapsed = (
+        df.groupby(["subject", "body_site", "operator", "rater"], as_index=False)
+        .agg(
+            measurement=("measurement", "median"),
+            ita=("ita", "median"),
+            **{
+                "L*": ("L*", "median"),
+                "b*": ("b*", "median"),
+            },
+        )
+        .sort_values(["subject", "body_site", "operator"])
+        .reset_index(drop=True)
+    )
+    collapsed["participant"] = collapsed["subject"]
+    collapsed["repeat_version"] = "collapsed_median"
+    collapsed["source_file"] = "collapsed_across_versions"
+    return collapsed
+
+
+def collapse_equiox_inter_operator(df: pd.DataFrame) -> pd.DataFrame:
+    collapsed = (
+        df.groupby(["subject", "body_site", "operator", "rater"], as_index=False)
+        .agg(
+            measurement=("measurement", "median"),
+            ita=("ita", "median"),
+            **{
+                "L*": ("L*", "median"),
+                "a*": ("a*", "median"),
+                "b*": ("b*", "median"),
+            },
+        )
+        .sort_values(["body_site", "operator"])
+        .reset_index(drop=True)
+    )
+    collapsed["test_id"] = "collapsed_median"
+    collapsed["source_file"] = "collapsed_across_tests"
+    return collapsed
+
+
+def add_replicate_index(
+    df: pd.DataFrame,
+    *,
+    group_columns: list[str],
+    sort_columns: list[str],
+) -> pd.DataFrame:
+    ranked = df.sort_values(sort_columns).copy()
+    ranked["replicate_index"] = ranked.groupby(group_columns).cumcount() + 1
+    return ranked
+
+
+def summarize_pairwise_by_site_only(pairwise_df: pd.DataFrame, body_site_order: list[str]) -> pd.DataFrame:
+    summary_df = summarize_pairwise_differences(pairwise_df, ["body_site", "rater_pair"])
+    summary_df["body_site"] = pd.Categorical(summary_df["body_site"], categories=body_site_order, ordered=True)
+    return summary_df.sort_values(["body_site", "rater_pair"]).reset_index(drop=True)
+
+
+def build_previous_km_inter_markdown(summary_df: pd.DataFrame, output_dir: Path, filename_prefix: str) -> str:
+    display_df = summary_df.drop(columns=["sd_difference"]).rename(columns={"mean_difference": "ITA difference"})
+    return "\n".join(
+        [
+            markdown_table(display_df, digits=3),
+            "",
+            build_bland_altman_markdown(output_dir, filename_prefix).rstrip(),
+        ]
+    )
 
 
 def analyze_participants(files: list[Path], output_dir: Path) -> None:
@@ -1003,6 +1419,183 @@ def analyze_triplicates(files: list[Path], output_dir: Path) -> None:
     )
 
 
+def analyze_uganda(files: list[Path], output_dir: Path) -> None:
+    df = load_uganda_data(files)
+    intra_cell_df, intra_summary_df = summarize_triplicates_intra_operator(
+        df, operator_order=UGANDA_OPERATOR_ORDER
+    )
+    intra_flagged_df = build_triplicates_flagged_cells(df, intra_cell_df, threshold=5.0)
+    heatmap_path = output_dir / "uganda_intra_operator_heatmap.png"
+    inter_df = collapse_uganda_inter_operator(df)
+    pairwise_df = build_pairwise_dataset(
+        inter_df,
+        index_columns=["subject", "body_site"],
+        pair_order=[("EB", "PE")],
+    )
+    inter_summary_df = summarize_uganda_inter_operator(pairwise_df)
+    present_body_sites = [site for site in UGANDA_BODY_SITE_ORDER if site in pairwise_df["body_site"].unique()]
+    marker_map = {site: BODY_SITE_MARKERS[site] for site in present_body_sites}
+    palette = {site: BODY_SITE_COLORS[site] for site in present_body_sites}
+
+    write_preprocessed_data(df, output_dir / "uganda_preprocessed_measurements.csv")
+    write_preprocessed_data(inter_df, output_dir / "uganda_inter_operator_collapsed_measurements.csv")
+    intra_cell_df.to_csv(output_dir / "uganda_cell_level_sd.csv", index=False)
+    intra_summary_df.to_csv(output_dir / "uganda_operator_summary.csv", index=False)
+    intra_flagged_df.to_csv(output_dir / "uganda_flagged_cells_sd_gt_5.csv", index=False)
+    pairwise_df.to_csv(output_dir / "uganda_pairwise_measurements.csv", index=False)
+    inter_summary_df.to_csv(output_dir / "uganda_pairwise_difference_summary.csv", index=False)
+    make_repeatability_heatmap(
+        intra_cell_df,
+        output_path=heatmap_path,
+        body_site_order=UGANDA_BODY_SITE_ORDER,
+        operator_order=UGANDA_OPERATOR_ORDER,
+    )
+    make_bland_altman_plots(
+        pairwise_df,
+        output_dir=output_dir,
+        filename_prefix="uganda_bland_altman",
+        section_label="Uganda Inter-operator Bland-Altman Plot",
+        cluster_column="subject",
+        hue_column="body_site",
+        hue_order=present_body_sites,
+        palette=palette,
+        style_column="body_site",
+        markers=marker_map,
+        annotate_column="subject",
+    )
+    write_markdown_file(
+        output_dir / "report_uganda_intra_operator.md",
+        build_uganda_intra_markdown(intra_summary_df, heatmap_path, intra_flagged_df),
+    )
+    write_markdown_file(
+        output_dir / "report_uganda_inter_operator.md",
+        build_uganda_inter_markdown(inter_summary_df, output_dir),
+    )
+    write_markdown_file(
+        output_dir / "report_uganda_inter_operator_raw_data.md",
+        build_uganda_raw_data_markdown(df),
+    )
+
+
+def analyze_fred(files: list[Path], output_dir: Path) -> None:
+    df = load_fred_data(files)
+    df = df[df["body_site"] != "Fingernail"].copy()
+    pairwise_df = build_pairwise_dataset(df, index_columns=["subject", "body_site"], pair_order=[("RB", "FB")])
+    fred_body_site_order = [site for site in PREVIOUS_KM_BODY_SITE_ORDER if site != "Fingernail"]
+    summary_df = summarize_pairwise_by_site_only(pairwise_df, fred_body_site_order)
+    present_body_sites = [site for site in fred_body_site_order if site in pairwise_df["body_site"].unique()]
+    marker_map = {site: BODY_SITE_MARKERS[site] for site in present_body_sites}
+    palette = {site: BODY_SITE_COLORS[site] for site in present_body_sites}
+
+    write_preprocessed_data(df, output_dir / "fred_preprocessed_measurements.csv")
+    pairwise_df.to_csv(output_dir / "fred_pairwise_measurements.csv", index=False)
+    summary_df.to_csv(output_dir / "fred_pairwise_difference_summary.csv", index=False)
+    make_bland_altman_plots(
+        pairwise_df,
+        output_dir=output_dir,
+        filename_prefix="fred_bland_altman",
+        section_label="Fred vs Ronald Bland-Altman Plot",
+        cluster_column="subject",
+        hue_column="body_site",
+        hue_order=present_body_sites,
+        palette=palette,
+        style_column="body_site",
+        markers=marker_map,
+    )
+    write_markdown_file(
+        output_dir / "report_fred_inter_operator.md",
+        build_previous_km_inter_markdown(summary_df, output_dir, "fred_bland_altman"),
+    )
+
+
+def analyze_equiox(files: list[Path], output_dir: Path) -> None:
+    metadata_path = Path("data/EquiOx ITA Repeatability/Copy of Minolta Testing.xlsx")
+    df = load_equiox_data(files, metadata_path)
+    df = df[df["body_site"].isin(EQUIOX_BODY_SITE_ORDER)].copy()
+
+    inter_df = df[
+        (df["operator"].isin(EQUIOX_INTER_OPERATOR_ORDER))
+        & (
+            (df["operator"] != "CC")
+            | (df["condition"] == "Control")
+        )
+    ].copy()
+    inter_collapsed_df = collapse_equiox_inter_operator(inter_df)
+    inter_pairwise_df = build_pairwise_dataset(
+        inter_collapsed_df,
+        index_columns=["subject", "body_site"],
+        pair_order=list(itertools.combinations(EQUIOX_INTER_OPERATOR_ORDER, 2)),
+    )
+    inter_summary_df = summarize_pairwise_by_site_only(inter_pairwise_df, EQUIOX_BODY_SITE_ORDER)
+    present_inter_sites = [site for site in EQUIOX_BODY_SITE_ORDER if site in inter_pairwise_df["body_site"].unique()]
+    inter_marker_map = {site: BODY_SITE_MARKERS[site] for site in present_inter_sites}
+    inter_palette = {site: BODY_SITE_COLORS[site] for site in present_inter_sites}
+
+    variable_df = df[(df["operator"] == "CC") & (df["condition"].isin(EQUIOX_VARIABLE_CHANGE_ORDER))].copy()
+    variable_df = add_replicate_index(
+        variable_df,
+        group_columns=["condition", "body_site"],
+        sort_columns=["condition", "body_site", "test_id"],
+    )
+    variable_pair_input = variable_df.drop(columns=["rater"]).rename(columns={"condition": "rater"})
+    variable_pairwise_df = build_pairwise_dataset(
+        variable_pair_input,
+        index_columns=["subject", "body_site", "replicate_index"],
+        pair_order=[("Control", "Pressure: Hard"), ("Control", "Lifiting")],
+    )
+    variable_pairwise_df["rater_pair"] = variable_pairwise_df["rater_pair"].replace(
+        {
+            "Control vs Pressure: Hard": "Control vs Hard Pressure",
+            "Control vs Lifiting": "Control vs Lifting",
+        }
+    )
+    variable_summary_df = summarize_pairwise_by_site_only(variable_pairwise_df, EQUIOX_BODY_SITE_ORDER)
+    present_variable_sites = [site for site in EQUIOX_BODY_SITE_ORDER if site in variable_pairwise_df["body_site"].unique()]
+    variable_marker_map = {site: BODY_SITE_MARKERS[site] for site in present_variable_sites}
+    variable_palette = {site: BODY_SITE_COLORS[site] for site in present_variable_sites}
+
+    write_preprocessed_data(df, output_dir / "equiox_preprocessed_measurements.csv")
+    write_preprocessed_data(inter_collapsed_df, output_dir / "equiox_inter_operator_preprocessed_measurements.csv")
+    inter_pairwise_df.to_csv(output_dir / "equiox_inter_operator_pairwise_measurements.csv", index=False)
+    inter_summary_df.to_csv(output_dir / "equiox_inter_operator_pairwise_difference_summary.csv", index=False)
+    write_preprocessed_data(variable_df, output_dir / "equiox_variable_change_preprocessed_measurements.csv")
+    variable_pairwise_df.to_csv(output_dir / "equiox_variable_change_pairwise_measurements.csv", index=False)
+    variable_summary_df.to_csv(output_dir / "equiox_variable_change_pairwise_difference_summary.csv", index=False)
+
+    make_bland_altman_plots(
+        inter_pairwise_df,
+        output_dir=output_dir,
+        filename_prefix="equiox_inter_operator_bland_altman",
+        section_label="EquiOx CRC Inter-operator Bland-Altman Plot",
+        cluster_column="subject",
+        hue_column="body_site",
+        hue_order=present_inter_sites,
+        palette=inter_palette,
+        style_column="body_site",
+        markers=inter_marker_map,
+    )
+    make_bland_altman_plots(
+        variable_pairwise_df,
+        output_dir=output_dir,
+        filename_prefix="equiox_variable_change_bland_altman",
+        section_label="EquiOx Condition Comparison Bland-Altman Plot",
+        cluster_column="replicate_index",
+        hue_column="body_site",
+        hue_order=present_variable_sites,
+        palette=variable_palette,
+        style_column="body_site",
+        markers=variable_marker_map,
+    )
+    write_markdown_file(
+        output_dir / "report_equiox_inter_operator.md",
+        build_previous_km_inter_markdown(inter_summary_df, output_dir, "equiox_inter_operator_bland_altman"),
+    )
+    write_markdown_file(
+        output_dir / "report_equiox_variable_change.md",
+        build_previous_km_inter_markdown(variable_summary_df, output_dir, "equiox_variable_change_bland_altman"),
+    )
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1013,6 +1606,9 @@ def main() -> None:
     monk_input = monk_files(files)
     ella_input = ella_files(files)
     triplicates_input = triplicates_files(files)
+    uganda_input = uganda_files(files)
+    fred_input = fred_files(files)
+    equiox_input = equiox_files(files)
 
     if not participant_input:
         raise ValueError("No participant files were found with 'Subject' in the filename.")
@@ -1022,11 +1618,20 @@ def main() -> None:
         raise ValueError("No Ella EB files were found.")
     if not triplicates_input:
         raise ValueError("No triplicates files were found.")
+    if not uganda_input:
+        raise ValueError("No Uganda repeatability files were found.")
+    if not fred_input:
+        raise ValueError("No Fred and Ronald repeatability files were found.")
+    if not equiox_input:
+        raise ValueError("No EquiOx repeatability files were found.")
 
     analyze_participants(participant_input, args.output_dir)
     analyze_monk(monk_input, args.output_dir)
     analyze_ella(ella_input, args.output_dir)
     analyze_triplicates(triplicates_input, args.output_dir)
+    analyze_uganda(uganda_input, args.output_dir)
+    analyze_fred(fred_input, args.output_dir)
+    analyze_equiox(equiox_input, args.output_dir)
 
 
 if __name__ == "__main__":

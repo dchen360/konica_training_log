@@ -1,0 +1,23 @@
+---
+title: "Konica Minolta Uganda Lab Repeatability Report"
+toc: true
+number-sections: true
+format:
+  html:
+    theme: cosmo
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+---
+
+# Intra-operator Analysis
+
+{{< include results/analysis/report_uganda_intra_operator.md >}}
+
+# Inter-operator Analysis
+
+{{< include results/analysis/report_uganda_inter_operator.md >}}
+
+## Raw Data
+
+{{< include results/analysis/report_uganda_inter_operator_raw_data.md >}}
