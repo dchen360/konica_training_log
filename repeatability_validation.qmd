@@ -1,0 +1,330 @@
+---
+title: "Konica Minolta Repeatability Validation"
+toc: true
+number-sections: true
+format:
+  html:
+    theme: cosmo
+    toc-depth: 3
+    code-fold: false
+    embed-resources: true
+execute:
+  echo: false
+---
+
+# Intra-operator Analysis
+
+```{python}
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from IPython.display import Markdown, display
+
+REQUIRED_RAW_COLUMNS = ("Group", "L*", "b*")
+BODY_SITE_NORMALIZATION = {
+    "Palmer": "Palmar",
+    "Arm": "Inner Upper Arm",
+    "Arms": "Inner Upper Arm",
+    "Inner arm": "Inner Upper Arm",
+    "Inner upper arm": "Inner Upper Arm",
+    "Inner upperarm": "Inner Upper Arm",
+    "Back of hand": "Back of Hand",
+    "Fingernail (A)": "Fingernail",
+    "Dorsal (B)": "Dorsal",
+    "Dorsal - DIP (B)": "Dorsal",
+    "Palmar (C)": "Palmar",
+    "Inner Arn (D)": "Inner Upper Arm",
+    "Inner Upper Arm (D)": "Inner Upper Arm",
+    "Forehead (E)": "Forehead",
+    "Forehead (G)": "Forehead",
+}
+BODY_SITE_ORDER = ["Inner Upper Arm", "Dorsal", "Forehead", "Palmar"]
+SUBJECT_REPEATABILITY_PATTERN = re.compile(r"Subject\s*(\d+)_([A-Za-z]+)_(\d+)$", re.IGNORECASE)
+TEST_WITH_REPEATABILITY_PATTERN = re.compile(
+    r"test with\s+(.+?)(?:-\d+)?\s+([A-Za-z]+)\s+(\d+)$",
+    re.IGNORECASE,
+)
+
+
+def compute_ita(l_value: float, b_value: float) -> float:
+    if pd.isna(l_value) or pd.isna(b_value) or b_value == 0:
+        return np.nan
+    return float(np.degrees(np.arctan((l_value - 50.0) / b_value)))
+
+
+def select_median_ita_rows(df: pd.DataFrame, group_columns: list[str]) -> pd.DataFrame:
+    scored = df.copy()
+    scored["_median_ita"] = scored.groupby(group_columns)["ita"].transform("median")
+    scored["_distance"] = (scored["ita"] - scored["_median_ita"]).abs()
+    scored = scored.sort_values(group_columns + ["_distance", "ita"], kind="mergesort")
+    reduced = (
+        scored.groupby(group_columns, as_index=False)
+        .head(1)
+        .drop(columns=["_median_ita", "_distance"])
+        .reset_index(drop=True)
+    )
+    reduced["measurement"] = reduced["ita"]
+    return reduced
+
+
+def extract_repeatability_metadata(path: Path) -> tuple[str, str, int]:
+    subject_match = SUBJECT_REPEATABILITY_PATTERN.search(path.stem)
+    if subject_match:
+        subject = f"Subject{int(subject_match.group(1))}"
+        operator = subject_match.group(2).upper()
+        repeat_version = int(subject_match.group(3))
+        return subject, operator, repeat_version
+
+    test_match = TEST_WITH_REPEATABILITY_PATTERN.search(path.stem)
+    if test_match:
+        subject = test_match.group(1).strip().title()
+        operator = test_match.group(2).upper()
+        repeat_version = int(test_match.group(3))
+        return subject, operator, repeat_version
+
+    raise ValueError(
+        "Could not extract repeatability metadata from filename. "
+        f"Expected either 'Subject3_EB_1.csv' or '... test with Katie-2 KH 1.csv': {path.name}"
+    )
+
+
+def collect_repeatability_files(root: Path) -> list[Path]:
+    files = sorted(
+        file
+        for file in root.rglob("*")
+        if file.is_file() and file.suffix.lower() in {".csv", ".xlsx", ".xls"}
+    )
+    matched = []
+    for file in files:
+        try:
+            extract_repeatability_metadata(file)
+        except ValueError:
+            continue
+        matched.append(file)
+    if not matched:
+        raise ValueError(
+            "No repeatability files were found. Expected filenames like "
+            "'Subject3_EB_1.csv' or '8-31-2026 test with Katie-2 KH 1.csv'."
+        )
+    return matched
+
+
+def load_repeatability_data(files: list[Path]) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+
+    for file in files:
+        subject, operator, repeat_version = extract_repeatability_metadata(file)
+
+        if file.suffix.lower() == ".csv":
+            df = pd.read_csv(file)
+        else:
+            df = pd.read_excel(file)
+
+        missing = [column for column in REQUIRED_RAW_COLUMNS if column not in df.columns]
+        if missing:
+            raise ValueError(f"{file.name} is missing required columns: {', '.join(missing)}")
+
+        trip = df.copy()
+        trip["source_file"] = file.name
+        trip["subject"] = subject
+        trip["operator"] = operator
+        trip["repeat_version"] = repeat_version
+        trip["body_site"] = trip["Group"].astype(str).str.strip().replace(BODY_SITE_NORMALIZATION)
+        trip["L*"] = pd.to_numeric(trip["L*"], errors="coerce")
+        trip["b*"] = pd.to_numeric(trip["b*"], errors="coerce")
+        trip = trip.dropna(subset=["body_site", "L*", "b*"])
+        trip = trip[trip["body_site"].isin(BODY_SITE_ORDER)].copy()
+        trip["ita"] = trip.apply(lambda row: compute_ita(row["L*"], row["b*"]), axis=1)
+        frames.append(trip)
+
+    if not frames:
+        raise ValueError("No valid repeatability records were loaded from the matched files.")
+
+    combined = pd.concat(frames, ignore_index=True)
+    reduced = select_median_ita_rows(combined, ["body_site", "subject", "operator", "repeat_version"])
+    reduced["body_site"] = pd.Categorical(reduced["body_site"], categories=BODY_SITE_ORDER, ordered=True)
+    reduced["_subject_sort_num"] = pd.to_numeric(reduced["subject"].str.extract(r"(\d+)")[0], errors="coerce")
+    reduced["_subject_sort_text"] = reduced["subject"].astype(str)
+    reduced = reduced.sort_values(
+        ["_subject_sort_num", "_subject_sort_text", "body_site", "operator", "repeat_version"],
+        na_position="last",
+    ).reset_index(drop=True)
+    return reduced.drop(columns=["_subject_sort_num", "_subject_sort_text"])
+
+
+def summarize_intra_operator(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    cell_df = (
+        df.groupby(["subject", "body_site", "operator"], observed=True)
+        .agg(
+            n_repeats=("measurement", "size"),
+            mean_median_ita=("measurement", "mean"),
+            cell_sd=("measurement", "std"),
+        )
+        .reset_index()
+        .sort_values(["subject", "body_site", "operator"])
+        .reset_index(drop=True)
+    )
+
+    summary_rows: list[dict[str, float | int | str]] = []
+    for operator, operator_df in cell_df.groupby("operator", observed=True):
+        valid = operator_df["cell_sd"].dropna()
+        pooled_within_sd = float(np.sqrt(np.mean(np.square(valid)))) if not valid.empty else np.nan
+        repeatability = 1.96 * np.sqrt(2) * pooled_within_sd if pd.notna(pooled_within_sd) else np.nan
+        summary_rows.append(
+            {
+                "operator": operator,
+                "n_cells": int(operator_df["cell_sd"].notna().sum()),
+                "pooled_within_sd": pooled_within_sd,
+                "repeatability_coefficient": repeatability,
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows).sort_values("operator").reset_index(drop=True)
+    return cell_df, summary_df
+
+
+def build_flagged_cells(df: pd.DataFrame, cell_df: pd.DataFrame, threshold: float = 5.0) -> pd.DataFrame:
+    wide = (
+        df.pivot_table(
+            index=["subject", "body_site", "operator"],
+            columns="repeat_version",
+            values="measurement",
+            aggfunc="first",
+            observed=True,
+        )
+        .reset_index()
+    )
+    version_numbers = sorted(column for column in wide.columns if isinstance(column, (int, np.integer)))
+    wide = wide.rename(columns={column: f"median_ita_v{int(column)}" for column in version_numbers})
+    flagged = cell_df[cell_df["cell_sd"] > threshold].copy()
+    if flagged.empty:
+        return flagged
+
+    merged = flagged.merge(wide, on=["subject", "body_site", "operator"], how="left")
+    desired_columns = ["subject", "body_site", "operator", "n_repeats", "cell_sd"] + [
+        f"median_ita_v{version}" for version in version_numbers
+    ]
+    return merged[desired_columns].sort_values(["subject", "body_site", "operator"]).reset_index(drop=True)
+
+
+def validate_repeatability_layout(df: pd.DataFrame, cell_df: pd.DataFrame) -> None:
+    operators = sorted(df["operator"].unique())
+    if len(operators) < 2:
+        raise ValueError("At least two operators are required for this report.")
+
+    insufficient = cell_df[cell_df["n_repeats"] < 3][["subject", "body_site", "operator", "n_repeats"]]
+    if not insufficient.empty:
+        preview = insufficient.head(10).to_dict("records")
+        raise ValueError(
+            "Each Subject x Body site x Operator cell must have at least 3 repeated files. "
+            f"Examples of insufficient cells: {preview}"
+        )
+
+
+def render_heatmap(cell_df: pd.DataFrame, output_path: Path) -> None:
+    heatmap_df = cell_df.copy()
+    heatmap_df["body_site"] = pd.Categorical(
+        heatmap_df["body_site"], categories=BODY_SITE_ORDER, ordered=True
+    )
+    def subject_sort_key(value: str) -> tuple[int, str | int]:
+        match = re.search(r"\d+", value)
+        if match:
+            return (0, int(match.group(0)))
+        return (1, value)
+
+    subject_order = sorted(heatmap_df["subject"].unique(), key=subject_sort_key)
+    operator_order = sorted(heatmap_df["operator"].unique())
+    heatmap_df["subject"] = pd.Categorical(heatmap_df["subject"], categories=subject_order, ordered=True)
+    heatmap_df = heatmap_df.sort_values(["subject", "body_site", "operator"]).reset_index(drop=True)
+    heatmap_df["subject_group"] = heatmap_df["subject"].astype(str) + " | " + heatmap_df["body_site"].astype(str)
+
+    matrix = heatmap_df.pivot(index="subject_group", columns="operator", values="cell_sd").reindex(
+        columns=operator_order
+    )
+    annot = matrix.apply(lambda column: column.map(lambda value: "" if pd.isna(value) else f"{value:.2f}"))
+
+    fig_height = max(4.5, len(matrix) * 0.45)
+    fig, ax = plt.subplots(figsize=(6.5, fig_height))
+    sns.heatmap(
+        matrix,
+        annot=annot,
+        fmt="",
+        cmap="YlOrRd",
+        linewidths=0.5,
+        linecolor="white",
+        cbar_kws={"label": "SD of median ITA"},
+        ax=ax,
+    )
+    ax.set_xlabel("Operator", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Subject | Body site", fontsize=12, fontweight="bold")
+    ax.tick_params(axis="x", rotation=0)
+    ax.tick_params(axis="y", rotation=0)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+```
+
+```{python}
+input_path = Path("data/8-31-2026 triplicates")
+output_dir = Path("results/repeatability_validation_2026_08_31_triplicates")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+files = collect_repeatability_files(input_path)
+repeatability_df = load_repeatability_data(files)
+cell_df, summary_df = summarize_intra_operator(repeatability_df)
+validate_repeatability_layout(repeatability_df, cell_df)
+flagged_df = build_flagged_cells(repeatability_df, cell_df, threshold=5.0)
+
+heatmap_path = output_dir / "repeatability_intra_operator_heatmap.png"
+render_heatmap(cell_df, heatmap_path)
+
+repeatability_df.to_csv(output_dir / "repeatability_preprocessed_measurements.csv", index=False)
+cell_df.to_csv(output_dir / "repeatability_cell_level_sd.csv", index=False)
+summary_df.to_csv(output_dir / "repeatability_operator_summary.csv", index=False)
+flagged_df.to_csv(output_dir / "repeatability_flagged_cells_sd_gt_5.csv", index=False)
+```
+
+```{python}
+display(summary_df.round(3))
+```
+
+## Heatmap
+
+```{python}
+display(Markdown(f"![]({heatmap_path.as_posix()})"))
+```
+
+## Cells With SD of Median ITA Greater Than 5
+
+```{python}
+if flagged_df.empty:
+    display(Markdown("No `Subject x Body site x Operator` cells had SD of median ITA greater than 5."))
+else:
+    display(flagged_df.round(3))
+```
+
+## Raw Median-ITA Cells
+
+```{python}
+display(
+    repeatability_df[
+        ["subject", "operator", "repeat_version", "body_site", "L*", "b*", "measurement"]
+    ]
+    .rename(
+        columns={
+            "subject": "Subject",
+            "operator": "Operator",
+            "repeat_version": "Repeat",
+            "body_site": "Body site",
+            "measurement": "Median ITA",
+        }
+    )
+    .round(3)
+)
+```

@@ -14,5 +14,4 @@ __pycache__/
 /.quarto/
 **/*.quarto_ipynb
 data/
-results/analysis/
-results/report/
+results/

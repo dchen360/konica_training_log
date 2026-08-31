@@ -305,7 +305,7 @@ def select_median_ita_rows(df: pd.DataFrame, group_columns: list[str]) -> pd.Dat
 
 
 def participant_files(files: list[Path]) -> list[Path]:
-    excluded_directories = {"triplicates", "Ella and Philip ITA Repeatability"}
+    excluded_directories = {"triplicates", "Ella and Philip ITA Repeatability", "Ella and Philip ITA Repeatability-2"}
     return [
         file
         for file in files
@@ -370,6 +370,15 @@ def uganda_files(files: list[Path]) -> list[Path]:
         for file in files
         if "Ella and Philip ITA Repeatability" in file.parts and UGANDA_FILENAME_PATTERN.search(file.stem)
     ]
+
+
+def uganda_files_from_root(root: Path) -> list[Path]:
+    uganda_root = root / "Ella and Philip ITA Repeatability"
+    if not uganda_root.exists():
+        return []
+    return sorted(
+        file for file in uganda_root.glob("*.csv") if file.is_file() and UGANDA_FILENAME_PATTERN.search(file.stem)
+    )
 
 
 def fred_files(files: list[Path]) -> list[Path]:
@@ -1606,7 +1615,7 @@ def main() -> None:
     monk_input = monk_files(files)
     ella_input = ella_files(files)
     triplicates_input = triplicates_files(files)
-    uganda_input = uganda_files(files)
+    uganda_input = uganda_files_from_root(args.input_path)
     fred_input = fred_files(files)
     equiox_input = equiox_files(files)
 
