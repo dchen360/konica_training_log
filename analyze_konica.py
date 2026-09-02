@@ -22,7 +22,10 @@ DATE_PATTERN = re.compile(r"(?P<month>\d{1,2})-(?P<day>\d{1,2})-(?P<year>\d{2,4}
 SID_PATTERN = re.compile(r"SID\s*([0-9]{3,4})", re.IGNORECASE)
 LEGACY_SUBJECT_ID_PATTERN = re.compile(r"Subject\s+\d+\s+\(([0-9]{3,4})\)", re.IGNORECASE)
 OPERATOR_SUFFIX_PATTERN = re.compile(r"(KH|EB|RVZ|LER|PE)\)?(?:\s*\(\d+\))?\s*$", re.IGNORECASE)
-TRIPLICATE_FILENAME_PATTERN = re.compile(r"Subject\s*(\d+)_(EB|KH|RVZ)_(\d+)$", re.IGNORECASE)
+TRIPLICATE_FILENAME_PATTERN = re.compile(
+    r"(?:\d{1,2}-\d{1,2}-\d{2,4}\s+)?Subject\s*(\d+)(?:\s+|_)(EB|KH|RVZ)(?:\s+|_)(\d+)$",
+    re.IGNORECASE,
+)
 UGANDA_FILENAME_PATTERN = re.compile(r"Subject\s*(\d+)_(EB|PE)_(\d+)$", re.IGNORECASE)
 REQUIRED_RAW_COLUMNS = ("Group", "L*", "b*")
 BODY_SITE_NORMALIZATION = {
@@ -305,11 +308,23 @@ def select_median_ita_rows(df: pd.DataFrame, group_columns: list[str]) -> pd.Dat
 
 
 def participant_files(files: list[Path]) -> list[Path]:
-    excluded_directories = {"triplicates", "Ella and Philip ITA Repeatability", "Ella and Philip ITA Repeatability-2"}
+    excluded_directory_tokens = {
+        "triplicates",
+        "ella and philip ita repeatability",
+        "ella and katie and rene ita repeatability",
+        "rene and lea ita repeatability",
+        "fred and ronald ita repeatability",
+        "equiox ita repeatability",
+        "ita measurement trials",
+    }
     return [
         file
         for file in files
-        if "subject" in file.name.lower() and not any(directory in file.parts for directory in excluded_directories)
+        if "subject" in file.name.lower()
+        and not any(
+            any(token in part.lower() for token in excluded_directory_tokens)
+            for part in file.parts
+        )
     ]
 
 
@@ -361,7 +376,12 @@ def ella_files(files: list[Path]) -> list[Path]:
 
 
 def triplicates_files(files: list[Path]) -> list[Path]:
-    return [file for file in files if "triplicates" in file.parts and TRIPLICATE_FILENAME_PATTERN.search(file.stem)]
+    selected_roots = {"triplicates", "ella and katie and rene ita repeatability"}
+    return [
+        file
+        for file in files
+        if any(part.lower() in selected_roots for part in file.parts) and TRIPLICATE_FILENAME_PATTERN.search(file.stem)
+    ]
 
 
 def uganda_files(files: list[Path]) -> list[Path]:
@@ -1017,6 +1037,7 @@ def summarize_triplicates_intra_operator(
     df: pd.DataFrame,
     *,
     operator_order: list[str] = TRIPLICATE_OPERATOR_ORDER,
+    by_body_site: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     cell_df = (
         df.groupby(["subject", "body_site", "operator"])
@@ -1031,23 +1052,46 @@ def summarize_triplicates_intra_operator(
     )
 
     summary_rows: list[dict] = []
-    for operator, operator_df in cell_df.groupby("operator"):
-        valid = operator_df["cell_sd"].dropna()
+    summary_groups = ["operator", "body_site"] if by_body_site else ["operator"]
+    for group_values, group_df in cell_df.groupby(summary_groups, observed=True):
+        if by_body_site:
+            operator, body_site = group_values
+        else:
+            operator = group_values
+            body_site = None
+
+        valid = group_df["cell_sd"].dropna()
         pooled_within_sd = float(np.sqrt(np.mean(np.square(valid)))) if not valid.empty else np.nan
         repeatability = 1.96 * np.sqrt(2) * pooled_within_sd if pd.notna(pooled_within_sd) else np.nan
-        summary_rows.append(
-            {
-                "operator": operator,
-                "n_cells": int(operator_df["cell_sd"].notna().sum()),
-                "pooled_within_sd": pooled_within_sd,
-                "repeatability_coefficient": repeatability,
-            }
-        )
+        row = {
+            "operator": operator,
+            "n_subject_site_cells": int(group_df["cell_sd"].notna().sum()),
+            "pooled_within_sd": pooled_within_sd,
+            "repeatability_coefficient": repeatability,
+        }
+        if by_body_site:
+            row["body_site"] = body_site
+        summary_rows.append(row)
 
     summary_df = pd.DataFrame(summary_rows)
     if not summary_df.empty:
         summary_df["operator"] = pd.Categorical(summary_df["operator"], categories=operator_order, ordered=True)
-        summary_df = summary_df.sort_values("operator").reset_index(drop=True)
+        if by_body_site:
+            summary_df["body_site"] = pd.Categorical(
+                summary_df["body_site"], categories=PARTICIPANT_BODY_SITE_ORDER, ordered=True
+            )
+            summary_df = summary_df.sort_values(["operator", "body_site"]).reset_index(drop=True)
+            summary_df = summary_df[
+                [
+                    "operator",
+                    "body_site",
+                    "n_subject_site_cells",
+                    "pooled_within_sd",
+                    "repeatability_coefficient",
+                ]
+            ]
+        else:
+            summary_df = summary_df.sort_values("operator").reset_index(drop=True)
 
     return cell_df, summary_df
 
@@ -1076,19 +1120,27 @@ def build_triplicates_flagged_cells(df: pd.DataFrame, cell_df: pd.DataFrame, thr
     return merged[present_columns].sort_values(["subject", "body_site", "operator"]).reset_index(drop=True)
 
 
-def make_triplicates_heatmap(cell_df: pd.DataFrame, output_path: Path) -> None:
+def make_triplicates_heatmap(
+    cell_df: pd.DataFrame,
+    output_path: Path,
+    operator_order: list[str],
+) -> None:
     heatmap_df = cell_df.copy()
-    heatmap_df["body_site"] = pd.Categorical(
-        heatmap_df["body_site"], categories=PARTICIPANT_BODY_SITE_ORDER, ordered=True
-    )
     subject_order = sorted(heatmap_df["subject"].unique(), key=lambda value: int(re.search(r"\d+", value).group(0)))
-    heatmap_df["subject"] = pd.Categorical(heatmap_df["subject"], categories=subject_order, ordered=True)
+    body_site_order = sorted(heatmap_df["body_site"].unique())
     heatmap_df = heatmap_df.sort_values(["subject", "body_site", "operator"]).reset_index(drop=True)
     heatmap_df["subject_group"] = heatmap_df["subject"].astype(str) + " | " + heatmap_df["body_site"].astype(str)
+    subject_group_order = [
+        f"{subject} | {body_site}"
+        for subject in subject_order
+        for body_site in body_site_order
+        if ((heatmap_df["subject"] == subject) & (heatmap_df["body_site"] == body_site)).any()
+    ]
 
     matrix = (
         heatmap_df.pivot(index="subject_group", columns="operator", values="cell_sd")
-        .reindex(columns=TRIPLICATE_OPERATOR_ORDER)
+        .reindex(index=subject_group_order)
+        .reindex(columns=operator_order)
     )
     annot = matrix.apply(lambda column: column.map(lambda value: "" if pd.isna(value) else f"{value:.2f}"))
 
@@ -1157,7 +1209,7 @@ def build_triplicates_markdown(summary_df: pd.DataFrame, heatmap_path: Path, fla
     lines = [
         "Each triplicates file is first reduced to one median ITA per body site.",
         "For each Subject x Body site x Operator cell, the SD is then calculated from the 3 session-level median ITA values.",
-        "The operator-specific pooled within-SD is `sqrt(mean(cell SD^2))`, and the repeatability coefficient is `1.96 * sqrt(2) * pooled within-SD`.",
+        "The pooled within-subject SD and repeatability coefficient are reported separately for each Operator x Body site. The repeatability coefficient is `1.96 * sqrt(2) * pooled within-SD`.",
         "",
         markdown_table(summary_df, digits=3),
         "",
@@ -1203,6 +1255,18 @@ def build_uganda_inter_markdown(summary_df: pd.DataFrame, output_dir: Path) -> s
         markdown_table(by_site_df, digits=3),
         "",
         build_bland_altman_markdown(output_dir, "uganda_bland_altman").rstrip(),
+    ]
+    return "\n".join(lines)
+
+
+def build_triplicates_inter_markdown(summary_df: pd.DataFrame, output_dir: Path) -> str:
+    by_site_df = summary_df[summary_df["body_site"] != "Overall"].reset_index(drop=True)
+    lines = [
+        "Each file is reduced to one median ITA per body site. For each Subject x Body site x Operator cell, the median of the 3 round-level median ITA values is used for the inter-operator comparison.",
+        "",
+        markdown_table(by_site_df, digits=3),
+        "",
+        build_bland_altman_markdown(output_dir, "triplicates_inter_operator_bland_altman").rstrip(),
     ]
     return "\n".join(lines)
 
@@ -1413,18 +1477,53 @@ def analyze_ella(files: list[Path], output_dir: Path) -> None:
 
 def analyze_triplicates(files: list[Path], output_dir: Path) -> None:
     df = load_triplicates_data(files)
-    cell_df, summary_df = summarize_triplicates_intra_operator(df)
+    operator_order = sorted(df["operator"].unique())
+    cell_df, summary_df = summarize_triplicates_intra_operator(
+        df,
+        operator_order=operator_order,
+        by_body_site=True,
+    )
     flagged_df = build_triplicates_flagged_cells(df, cell_df, threshold=5.0)
     heatmap_path = output_dir / "triplicates_intra_operator_heatmap.png"
+    inter_df = collapse_uganda_inter_operator(df)
+    pairwise_df = build_pairwise_dataset(
+        inter_df,
+        index_columns=["subject", "body_site"],
+        pair_order=[("KH", "RVZ")],
+    )
+    inter_summary_df = summarize_uganda_inter_operator(pairwise_df)
+    present_body_sites = [site for site in PARTICIPANT_BODY_SITE_ORDER if site in pairwise_df["body_site"].unique()]
+    marker_map = {site: BODY_SITE_MARKERS[site] for site in present_body_sites}
+    palette = {site: BODY_SITE_COLORS[site] for site in present_body_sites}
 
     write_preprocessed_data(df, output_dir / "triplicates_preprocessed_measurements.csv")
+    write_preprocessed_data(inter_df, output_dir / "triplicates_inter_operator_collapsed_measurements.csv")
     cell_df.to_csv(output_dir / "triplicates_cell_level_sd.csv", index=False)
     summary_df.to_csv(output_dir / "triplicates_operator_summary.csv", index=False)
     flagged_df.to_csv(output_dir / "triplicates_flagged_cells_sd_gt_5.csv", index=False)
-    make_triplicates_heatmap(cell_df, heatmap_path)
+    pairwise_df.to_csv(output_dir / "triplicates_inter_operator_pairwise_measurements.csv", index=False)
+    inter_summary_df.to_csv(output_dir / "triplicates_inter_operator_pairwise_difference_summary.csv", index=False)
+    make_triplicates_heatmap(cell_df, heatmap_path, operator_order)
+    make_bland_altman_plots(
+        pairwise_df,
+        output_dir=output_dir,
+        filename_prefix="triplicates_inter_operator_bland_altman",
+        section_label="ITA Measurement Trials 09-01-2026 Inter-operator Bland-Altman Plot",
+        cluster_column="subject",
+        hue_column="body_site",
+        hue_order=present_body_sites,
+        palette=palette,
+        style_column="body_site",
+        markers=marker_map,
+        annotate_column="subject",
+    )
     write_markdown_file(
         output_dir / "report_triplicates_intra_operator.md",
         build_triplicates_markdown(summary_df, heatmap_path, flagged_df),
+    )
+    write_markdown_file(
+        output_dir / "report_triplicates_inter_operator.md",
+        build_triplicates_inter_markdown(inter_summary_df, output_dir),
     )
 
 
