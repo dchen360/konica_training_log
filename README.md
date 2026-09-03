@@ -59,9 +59,11 @@ uv run python analyze_konica.py data
 Render the HTML reports:
 
 ```bash
-quarto render ucsf_lab.qmd --to html --output-dir results/report
-quarto render uganda_lab.qmd --to html --output-dir results/report
+quarto render ucsf_lab.qmd --to html --output-dir results/report --no-clean
+quarto render uganda_lab.qmd --to html --output-dir results/report --no-clean
 ```
+
+Use `--no-clean` when rendering into the shared `results/report/` directory so that rendering one report does not remove the others.
 
 ## Outputs
 

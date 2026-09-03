@@ -271,7 +271,7 @@ def render_heatmap(cell_df: pd.DataFrame, output_path: Path) -> None:
 ```
 
 ```{python}
-input_path = Path("data/8-31-2026 triplicates")
+input_path = Path("data/ucsf_lab/Katie_Rene_Aug31_2026_triplicates")
 output_dir = Path("results/repeatability_validation_2026_08_31_triplicates")
 output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -291,7 +291,7 @@ flagged_df.to_csv(output_dir / "repeatability_flagged_cells_sd_gt_5.csv", index=
 ```
 
 ```{python}
-display(summary_df.round(3))
+display(summary_df.round(2))
 ```
 
 ## Heatmap
@@ -306,7 +306,7 @@ display(Markdown(f"![]({heatmap_path.as_posix()})"))
 if flagged_df.empty:
     display(Markdown("No `Subject x Body site x Operator` cells had SD of median ITA greater than 5."))
 else:
-    display(flagged_df.round(3))
+    display(flagged_df.round(2))
 ```
 
 ## Raw Median-ITA Cells
@@ -325,6 +325,6 @@ display(
             "measurement": "Median ITA",
         }
     )
-    .round(3)
+    .round(2)
 )
 ```
