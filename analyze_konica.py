@@ -1670,6 +1670,7 @@ def analyze_triplicates(files: list[Path], output_dir: Path) -> None:
         palette=palette,
         style_column="body_site",
         markers=marker_map,
+        legend_kwargs={"loc": "center left", "bbox_to_anchor": (1.02, 0.5)},
         annotate_column="subject",
     )
     write_markdown_file(
