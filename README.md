@@ -21,7 +21,7 @@ Within each file, the script expects:
 - `L*`
 - `b*`
 
-It computes ITA with `openox.ita(...)`, then for each `participant` x `rater` x `body_site` triplicate it keeps the row whose ITA is the median. The retained ITA is used as the analysis measurement.
+It computes ITA from L* and b*, then for each `participant` x `rater` x `body_site` triplicate it keeps the row whose ITA is the median. The retained ITA is used as the analysis measurement.
 
 The script can also accept a preprocessed CSV or Excel file if it already contains:
 
@@ -47,8 +47,6 @@ Create the environment and install dependencies:
 uv venv .venv
 uv sync
 ```
-
-`openox-library` is installed from its GitHub repository through the project dependency definition.
 
 Run the analysis on a folder of raw participant files:
 
