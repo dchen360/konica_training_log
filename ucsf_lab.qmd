@@ -1,7 +1,7 @@
 ---
-title: "ITA Measurement Trials 09-01-2026 Report"
+title: "ITA Training Log"
 toc: true
-number-sections: true
+number-sections: false
 format:
   html:
     theme: cosmo
@@ -10,12 +10,14 @@ format:
     embed-resources: true
 ---
 
-# ITA Measurement Trials 09-01-2026
+# Methods
 
-## Intra-operator Variation
+Each of the 19 subjects was measured by each operator at each body site using three sets of triplicate measurements. The median ITA was calculated for each triplicate set, yielding three set-level medians per subject, operator, and body site. For the intra-operator analysis, the SD of these three medians was calculated for each subject and pooled across subjects separately for each operator and body site to assess measurement repeatability. The pooled within-subject SD and repeatability coefficient are reported. For the inter-operator analysis, the median of the three set-level medians was used as the final ITA value for each subject, operator, and body site. Pairwise operator comparisons are presented separately for each body site, including the mean ITA difference, SD of the differences, and 95% limits of agreement (mean difference ± 1.96 × SD of the differences). For each operator pair, a Bland–Altman figure presents the four body sites in a 2 × 2 grid. Each panel shows 19 paired subject-level ITA values, with the operator difference plotted against the pairwise mean, together with the site-specific mean difference and 95% limits of agreement. Body sites are distinguished by color and shape, and axis scales are consistent across all panels and figures.
 
-{{< include results/analysis/report_triplicates_intra_operator.md >}}
+# Intra-operator Variation
 
-## Inter-operator Agreement
+{{< include results/analysis/ucsf_lab_09-11-2026/report_triplicates_intra_operator.md >}}
 
-{{< include results/analysis/report_triplicates_inter_operator.md >}}
+# Inter-operator Agreement
+
+{{< include results/analysis/ucsf_lab_09-11-2026/report_triplicates_inter_operator.md >}}

@@ -1298,25 +1298,16 @@ def make_repeatability_heatmap(
 
 def build_triplicates_markdown(summary_df: pd.DataFrame, heatmap_path: Path, flagged_df: pd.DataFrame) -> str:
     lines = [
-        "Each triplicates file is first reduced to one median ITA per body site.",
-        "For each Subject x Body site x Operator cell, the SD is then calculated from the 3 session-level median ITA values.",
-        "The pooled within-subject SD and repeatability coefficient are reported separately for each Operator x Body site. The repeatability coefficient is `1.96 * sqrt(2) * pooled within-SD`.",
+        markdown_table(summary_df, digits=2).replace(
+            "repeatability coefficient", "repeatability coefficient^a^", 1
+        ),
         "",
-        markdown_table(summary_df, digits=2),
+        "::: {.small}",
+        "^a^ The repeatability coefficient is `1.96 * sqrt(2) * pooled within-SD`.",
+        ":::",
         "",
         f"![]({heatmap_path.as_posix()})",
     ]
-    if flagged_df.empty:
-        lines.extend(["", "No Subject x Body site x Operator cells had SD of median ITA greater than 5."])
-    else:
-        lines.extend(
-            [
-                "",
-                "## Cells With SD of Median ITA Greater Than 5",
-                "",
-                markdown_table(flagged_df, digits=2),
-            ]
-        )
     return "\n".join(lines)
 
 
@@ -1376,8 +1367,6 @@ def build_inter_operator_markdown(summary_df: pd.DataFrame, output_dir: Path, fi
 def build_triplicates_inter_markdown(summary_df: pd.DataFrame, output_dir: Path) -> str:
     by_site_df = summary_df[summary_df["body_site"] != "Overall"].reset_index(drop=True)
     lines = [
-        "Each file is reduced to one median ITA per body site. For each Subject x Body site x Operator cell, the median of the 3 round-level median ITA values is used for the inter-operator comparison.",
-        "",
         markdown_table(format_inter_operator_summary(by_site_df), digits=2),
         "",
         build_bland_altman_markdown(output_dir, "triplicates_inter_operator_bland_altman").rstrip(),
@@ -1630,6 +1619,61 @@ def analyze_ella(files: list[Path], output_dir: Path) -> None:
     write_markdown_file(output_dir / "report_ella_intra_operator.md", build_ella_intra_markdown(plot_path))
 
 
+def make_triplicates_site_bland_altman_plots(
+    pairwise_df: pd.DataFrame, summary_df: pd.DataFrame, output_dir: Path
+) -> None:
+    """Plot independent subject pairs per site using the table's agreement limits."""
+    sns.set_theme(style="whitegrid")
+    site_summary = summary_df[summary_df["body_site"] != "Overall"]
+    x_min = pairwise_df["mean_measurement"].min()
+    x_max = pairwise_df["mean_measurement"].max()
+    y_min = min(pairwise_df["difference"].min(), site_summary["loa_lower"].min())
+    y_max = max(pairwise_df["difference"].max(), site_summary["loa_upper"].max())
+    x_padding = max((x_max - x_min) * 0.05, 1.0)
+    y_padding = max((y_max - y_min) * 0.12, 1.0)
+
+    for pair, pair_df in pairwise_df.groupby("rater_pair"):
+        fig, axes = plt.subplots(2, 2, figsize=(12, 9), sharex=True, sharey=True)
+        for ax, site in zip(axes.flat, PARTICIPANT_BODY_SITE_ORDER):
+            points = pair_df[pair_df["body_site"] == site]
+            stats = site_summary[
+                (site_summary["rater_pair"] == pair) & (site_summary["body_site"] == site)
+            ]
+            ax.set_title(f"{site} (n = {len(points)})", fontweight="bold")
+            ax.set_xlim(x_min - x_padding, x_max + x_padding)
+            ax.set_ylim(y_min - y_padding, y_max + y_padding)
+            if stats.empty:
+                continue
+            stats = stats.iloc[0]
+            ax.scatter(
+                points["mean_measurement"], points["difference"],
+                color=BODY_SITE_COLORS[site], marker=BODY_SITE_MARKERS[site],
+                s=55, alpha=0.85,
+            )
+            for value, label, color, style in [
+                (stats["mean_difference"], "Mean diff", "black", "-"),
+                (stats["loa_upper"], "Upper LoA", "firebrick", "--"),
+                (stats["loa_lower"], "Lower LoA", "firebrick", "--"),
+            ]:
+                ax.axhline(value, color=color, linestyle=style, linewidth=1.2)
+                ax.text(
+                    0.98, value, f"{label} = {value:.2f}",
+                    transform=ax.get_yaxis_transform(), ha="right",
+                    va="top" if label == "Lower LoA" else "bottom", fontsize=9,
+                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
+                )
+        x_label, y_label = format_bland_altman_axis_labels(pair)
+        fig.supxlabel(f"Mean ITA: {x_label}")
+        fig.supylabel(f"ITA difference: {y_label}")
+        fig.suptitle(f"Bland–Altman agreement: {pair}", fontsize=16, fontweight="bold")
+        fig.tight_layout()
+        fig.savefig(
+            output_dir / f"triplicates_inter_operator_bland_altman_{safe_slug(pair)}.png",
+            dpi=200, bbox_inches="tight",
+        )
+        plt.close(fig)
+
+
 def analyze_triplicates(files: list[Path], output_dir: Path) -> None:
     df = load_triplicates_data(files)
     operator_order = sorted(df["operator"].unique())
@@ -1644,12 +1688,9 @@ def analyze_triplicates(files: list[Path], output_dir: Path) -> None:
     pairwise_df = build_pairwise_dataset(
         inter_df,
         index_columns=["subject", "body_site"],
-        pair_order=[("KH", "RVZ")],
+        pair_order=[("KH", "RVZ"), ("EB", "RVZ"), ("EB", "KH")],
     )
     inter_summary_df = summarize_uganda_inter_operator(pairwise_df)
-    present_body_sites = [site for site in PARTICIPANT_BODY_SITE_ORDER if site in pairwise_df["body_site"].unique()]
-    marker_map = {site: BODY_SITE_MARKERS[site] for site in present_body_sites}
-    palette = {site: BODY_SITE_COLORS[site] for site in present_body_sites}
 
     write_preprocessed_data(df, output_dir / "triplicates_preprocessed_measurements.csv")
     write_preprocessed_data(inter_df, output_dir / "triplicates_inter_operator_collapsed_measurements.csv")
@@ -1659,20 +1700,7 @@ def analyze_triplicates(files: list[Path], output_dir: Path) -> None:
     pairwise_df.to_csv(output_dir / "triplicates_inter_operator_pairwise_measurements.csv", index=False)
     inter_summary_df.to_csv(output_dir / "triplicates_inter_operator_pairwise_difference_summary.csv", index=False)
     make_triplicates_heatmap(cell_df, heatmap_path, operator_order)
-    make_bland_altman_plots(
-        pairwise_df,
-        output_dir=output_dir,
-        filename_prefix="triplicates_inter_operator_bland_altman",
-        section_label="ITA Measurement Trials 09-01-2026 Inter-operator Bland-Altman Plot",
-        cluster_column="subject",
-        hue_column="body_site",
-        hue_order=present_body_sites,
-        palette=palette,
-        style_column="body_site",
-        markers=marker_map,
-        legend_kwargs={"loc": "center left", "bbox_to_anchor": (1.02, 0.5)},
-        annotate_column="subject",
-    )
+    make_triplicates_site_bland_altman_plots(pairwise_df, inter_summary_df, output_dir)
     write_markdown_file(
         output_dir / "report_triplicates_intra_operator.md",
         build_triplicates_markdown(summary_df, heatmap_path, flagged_df),
