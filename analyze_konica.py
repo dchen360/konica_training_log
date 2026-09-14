@@ -78,6 +78,9 @@ BODY_SITE_COLORS = {
     "Palmar": "#6a3d9a",
 }
 TRIPLICATE_OPERATOR_ORDER = ["EB", "KH", "RVZ"]
+UCSF_TRIALS_DIRECTORY = "ITA Measurement trials 09-11-2026"
+# Freeze the original 19-subject heatmap limits so exclusions do not recolor values.
+UCSF_HEATMAP_LIMITS = (0.1858565174723916, 24.51677598998897)
 UGANDA_OPERATOR_ORDER = ["EB", "PE"]
 PHILIP_ELLA_OPERATOR_ORDER = ["EB", "PE"]
 FRED_OPERATOR_ORDER = ["RB", "FB"]
@@ -1215,6 +1218,8 @@ def make_triplicates_heatmap(
     cell_df: pd.DataFrame,
     output_path: Path,
     operator_order: list[str],
+    *,
+    color_limits: tuple[float, float] | None = None,
 ) -> None:
     heatmap_df = cell_df.copy()
     subject_order = sorted(heatmap_df["subject"].unique(), key=subject_sort_key)
@@ -1242,6 +1247,8 @@ def make_triplicates_heatmap(
         annot=annot,
         fmt="",
         cmap="YlOrRd",
+        vmin=color_limits[0] if color_limits else None,
+        vmax=color_limits[1] if color_limits else None,
         linewidths=0.5,
         linecolor="white",
         cbar_kws={"label": "SD of median ITA"},
@@ -1676,6 +1683,15 @@ def make_triplicates_site_bland_altman_plots(
 
 def analyze_triplicates(files: list[Path], output_dir: Path) -> None:
     df = load_triplicates_data(files)
+    is_ucsf_september_11 = bool(files) and all(
+        file.parent.name == UCSF_TRIALS_DIRECTORY for file in files
+    )
+    if is_ucsf_september_11:
+        df = df.loc[df["subject"] != "Subject15"].copy()
+        df["original_subject"] = df["subject"]
+        subject_numbers = df["subject"].str.extract(r"^Subject(\d+)$", expand=False).astype(int)
+        df["subject"] = "Subject" + (subject_numbers - (subject_numbers > 15)).astype(str)
+        df["participant"] = df["subject"]
     operator_order = sorted(df["operator"].unique())
     cell_df, summary_df = summarize_triplicates_intra_operator(
         df,
@@ -1699,7 +1715,10 @@ def analyze_triplicates(files: list[Path], output_dir: Path) -> None:
     flagged_df.to_csv(output_dir / "triplicates_flagged_cells_sd_gt_5.csv", index=False)
     pairwise_df.to_csv(output_dir / "triplicates_inter_operator_pairwise_measurements.csv", index=False)
     inter_summary_df.to_csv(output_dir / "triplicates_inter_operator_pairwise_difference_summary.csv", index=False)
-    make_triplicates_heatmap(cell_df, heatmap_path, operator_order)
+    make_triplicates_heatmap(
+        cell_df, heatmap_path, operator_order,
+        color_limits=UCSF_HEATMAP_LIMITS if is_ucsf_september_11 else None,
+    )
     make_triplicates_site_bland_altman_plots(pairwise_df, inter_summary_df, output_dir)
     write_markdown_file(
         output_dir / "report_triplicates_intra_operator.md",
